@@ -179,7 +179,9 @@ service cloud.firestore {
         );
 
       // Authorized Staff Only: Call next customer, recall, toggle priority, or update ticket status
+      // Once a customer ticket is 'Served', it is permanently locked and cannot be edited/changed
       allow update: if isAdmin() &&
+        existing().status != 'Served' &&
         isValidId(customerId) &&
         isValidQueueCustomer(incoming()) &&
         incoming().id == existing().id &&
