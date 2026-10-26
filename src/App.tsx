@@ -897,8 +897,11 @@ export default function App() {
     });
   };
 
-  // Toggle Priority Lane status for a customer from Staff Console
-  const handleToggleCustomerPriority = async (customer: QueueCustomer) => {
+  // Update Priority Lane category for a customer from Staff Console dropdown
+  const handleChangeCustomerPriority = async (
+    customer: QueueCustomer,
+    nextCategory: PriorityCategory
+  ) => {
     if (!currentUser || !isStaffVerified) {
       setShowStaffAuthBanner(true);
       setStaffBannerMessage({
@@ -916,10 +919,12 @@ export default function App() {
       return;
     }
 
-    const nextIsPriority = !customer.isPriority;
-    const nextCategory: PriorityCategory = nextIsPriority
-      ? 'Senior Citizen'
+    const currentCategory: PriorityCategory = customer.isPriority
+      ? customer.priorityCategory || 'Senior Citizen'
       : 'Regular';
+    if (currentCategory === nextCategory) return;
+
+    const nextIsPriority = nextCategory !== 'Regular';
 
     try {
       await updateDoc(doc(db, 'queue_customers', customer.id), {
@@ -942,6 +947,13 @@ export default function App() {
         ? `Assigned to Priority Lane (${nextCategory})`
         : 'Moved to Regular Queue tier'
     );
+
+    setStaffBannerMessage({
+      type: 'info',
+      text: nextIsPriority
+        ? `Updated ${customer.queueCode} (${customer.name}) to Priority Lane (${nextCategory}).`
+        : `Updated ${customer.queueCode} (${customer.name}) to Regular Lane.`,
+    });
   };
 
   // Requirement 5 & 7: Allow Authorized Staff to mark customers as Waiting, Serving, Served, Skipped
@@ -2197,114 +2209,94 @@ export default function App() {
                               {renderStatusText(customer.status)}
                             </td>
                             <td className="py-3 px-4 text-right whitespace-nowrap">
-                              {isServed ? (
-                                <div
-                                  className="inline-flex items-center justify-end gap-1.5 text-xs font-medium text-slate-400 select-none"
-                                  title="This queue ticket has been Served and can no longer be edited or changed."
+                              <div className="inline-flex items-center justify-end gap-2">
+                                {isServed && (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-xs font-medium text-slate-400 mr-1"
+                                    title="This ticket is Served and locked from further changes."
+                                  >
+                                    <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                    <span>Locked</span>
+                                  </span>
+                                )}
+
+                                {/* Priority Lane Dropdown */}
+                                <select
+                                  aria-label={`Priority lane for ${customer.queueCode}`}
+                                  disabled={isServed}
+                                  value={
+                                    customer.isPriority
+                                      ? customer.priorityCategory ||
+                                        'Senior Citizen'
+                                      : 'Regular'
+                                  }
+                                  onChange={(e) =>
+                                    handleChangeCustomerPriority(
+                                      customer,
+                                      e.target.value as PriorityCategory
+                                    )
+                                  }
+                                  className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors focus:outline-none focus:ring-2 focus:ring-slate-900 ${
+                                    isServed
+                                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                                      : customer.isPriority
+                                      ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100 cursor-pointer font-semibold'
+                                      : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50 cursor-pointer'
+                                  }`}
                                 >
-                                  <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                                  <span>Served · Locked</span>
-                                </div>
-                              ) : (
-                                <div className="inline-flex items-center justify-end gap-1">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleToggleCustomerPriority(customer)
-                                    }
-                                    className={`px-2 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                                      customer.isPriority
-                                        ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
-                                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                    }`}
-                                  >
-                                    {customer.isPriority
-                                      ? 'Priority ★'
-                                      : 'Set Priority'}
-                                  </button>
+                                  <option value="Regular">Regular Lane</option>
+                                  <option value="Senior Citizen">
+                                    Priority · Senior Citizen
+                                  </option>
+                                  <option value="PWD">Priority · PWD</option>
+                                  <option value="Pregnant">
+                                    Priority · Pregnant
+                                  </option>
+                                  <option value="Emergency">
+                                    Priority · Emergency
+                                  </option>
+                                </select>
 
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleUpdateCustomerStatus(
-                                        customer,
-                                        QueueStatus.Waiting
-                                      )
-                                    }
-                                    disabled={
-                                      customer.status === QueueStatus.Waiting
-                                    }
-                                    className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                      customer.status === QueueStatus.Waiting
-                                        ? 'bg-amber-600 text-white border-amber-600 font-semibold cursor-default'
-                                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 cursor-pointer'
-                                    }`}
-                                  >
+                                {/* Queue Status Dropdown */}
+                                <select
+                                  aria-label={`Queue status for ${customer.queueCode}`}
+                                  disabled={isServed}
+                                  value={customer.status}
+                                  onChange={(e) =>
+                                    handleUpdateCustomerStatus(
+                                      customer,
+                                      e.target.value as QueueStatus
+                                    )
+                                  }
+                                  className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors focus:outline-none focus:ring-2 focus:ring-slate-900 ${
+                                    isServed
+                                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                                      : customer.status === QueueStatus.Serving
+                                      ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100 cursor-pointer'
+                                      : customer.status === QueueStatus.Waiting
+                                      ? 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100 cursor-pointer'
+                                      : 'bg-rose-50 text-rose-900 border-rose-300 hover:bg-rose-100 cursor-pointer'
+                                  }`}
+                                >
+                                  <option value={QueueStatus.Waiting}>
                                     Waiting
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleUpdateCustomerStatus(
-                                        customer,
-                                        QueueStatus.Serving
-                                      )
-                                    }
-                                    disabled={
-                                      customer.status === QueueStatus.Serving ||
-                                      isServedOrSkipped
-                                    }
-                                    title={
-                                      isServedOrSkipped
-                                        ? 'Skipped customers cannot be called directly as the active customer. Mark as Waiting first to re-queue.'
-                                        : 'Call and mark customer as Serving'
-                                    }
-                                    className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                      customer.status === QueueStatus.Serving
-                                        ? 'bg-emerald-600 text-white border-emerald-600 font-semibold cursor-default'
-                                        : isServedOrSkipped
-                                        ? 'bg-slate-50 text-slate-300 border-slate-200 cursor-not-allowed'
-                                        : 'bg-white text-slate-700 border-slate-200 hover:bg-emerald-50 hover:text-emerald-800 hover:border-emerald-300 cursor-pointer'
-                                    }`}
+                                  </option>
+                                  <option
+                                    value={QueueStatus.Serving}
+                                    disabled={isServedOrSkipped}
                                   >
-                                    Serving
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleUpdateCustomerStatus(
-                                        customer,
-                                        QueueStatus.Served
-                                      )
-                                    }
-                                    className="px-2.5 py-1 text-xs font-medium rounded-md border bg-white text-slate-700 border-slate-200 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                                  >
+                                    {customer.status === QueueStatus.Skipped
+                                      ? 'Serving (Mark Waiting first)'
+                                      : 'Serving'}
+                                  </option>
+                                  <option value={QueueStatus.Served}>
                                     Served
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleUpdateCustomerStatus(
-                                        customer,
-                                        QueueStatus.Skipped
-                                      )
-                                    }
-                                    disabled={
-                                      customer.status === QueueStatus.Skipped
-                                    }
-                                    className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                      customer.status === QueueStatus.Skipped
-                                        ? 'bg-rose-600 text-white border-rose-600 font-semibold cursor-default'
-                                        : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50 hover:text-rose-800 hover:border-rose-300 cursor-pointer'
-                                    }`}
-                                  >
+                                  </option>
+                                  <option value={QueueStatus.Skipped}>
                                     Skipped
-                                  </button>
-                                </div>
-                              )}
+                                  </option>
+                                </select>
+                              </div>
                             </td>
                           </tr>
                         );
