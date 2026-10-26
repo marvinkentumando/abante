@@ -25,6 +25,7 @@ import {
   BellRing,
   HeartHandshake,
   Megaphone,
+  Ticket,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -78,6 +79,16 @@ const MAX_DESCRIPTION_LENGTH = 200;
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 const VALID_QUEUE_CODE_REGEX = /^Q-[0-9]{3,6}$/;
 
+type AppPage = 'kiosk' | 'staff' | 'tv';
+
+function getInitialPageFromHash(): AppPage {
+  if (typeof window === 'undefined') return 'kiosk';
+  const hash = window.location.hash.toLowerCase();
+  if (hash.includes('staff')) return 'staff';
+  if (hash.includes('tv')) return 'tv';
+  return 'kiosk';
+}
+
 function formatCurrentTime(): string {
   const now = new Date();
   return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -89,7 +100,6 @@ function sanitizeId(rawId: string): string {
 }
 
 function formatQueueCodeForSpeech(queueCode: string): string {
-  // Convert "Q-104" -> "Q 1 0 4" for clear spoken articulation
   const parts = queueCode.split('-');
   if (parts.length === 2) {
     return `${parts[0]} ${parts[1].split('').join(' ')}`;
@@ -166,6 +176,26 @@ function playCallChime(enabled: boolean) {
 }
 
 export default function App() {
+  // Active Separated Page State ('kiosk' = Public Customer Kiosk, 'staff' = Authorized Staff Console, 'tv' = Public TV Display)
+  const [activePage, setActivePage] = useState<AppPage>(getInitialPageFromHash);
+
+  // Sync URL hash with activePage so separate browser windows can bookmark #/kiosk, #/staff, or #/tv
+  const navigateToPage = (page: AppPage) => {
+    setActivePage(page);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', `#/${page}`);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setActivePage(getInitialPageFromHash());
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
   // Firebase Auth & Staff Role State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isStaffVerified, setIsStaffVerified] = useState<boolean>(false);
@@ -182,7 +212,7 @@ export default function App() {
   );
   const [isCloudConnected, setIsCloudConnected] = useState<boolean>(false);
 
-  // Customer Check-In Form State (Public Kiosk — No Login Required)
+  // Customer Check-In Form State (Public Kiosk Page — No Login Required)
   const [customerName, setCustomerName] = useState('');
   const [customerPurpose, setCustomerPurpose] = useState(SERVICE_PURPOSES[0]);
   const [customerPriorityCategory, setCustomerPriorityCategory] =
@@ -191,15 +221,13 @@ export default function App() {
   const [lastIssuedTicket, setLastIssuedTicket] =
     useState<IssuedTicketReceipt | null>(null);
 
-  // Dedicated Full-Screen TV / Monitor Display Mode & Audio/Voice Announcements
-  const [isTvDisplayMode, setIsTvDisplayMode] = useState<boolean>(false);
+  // Audio/Voice Announcements & Flash State
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
   const [isFlashingNowServing, setIsFlashingNowServing] =
     useState<boolean>(false);
   const [liveClock, setLiveClock] = useState<string>(() => formatCurrentTime());
 
-  // Track previous active serving ticket + recall count to trigger visual flash on updates
   const prevServingSignatureRef = useRef<string | null>(null);
 
   // Staff Controls & UI Feedback State
@@ -443,9 +471,6 @@ export default function App() {
     return sortedCustomers.find((c) => c.status === QueueStatus.Serving) || null;
   }, [sortedCustomers]);
 
-  // Priority-aware Waiting Queue:
-  // Places Priority customers (Senior Citizen, PWD, Pregnant, Emergency) ahead of Regular customers
-  // while strictly preserving sequential arrival order (sequenceNumber) within each tier!
   const waitingCustomers = useMemo(() => {
     return sortedCustomers
       .filter((c) => c.status === QueueStatus.Waiting)
@@ -453,7 +478,7 @@ export default function App() {
         const aPrio = a.isPriority ? 1 : 0;
         const bPrio = b.isPriority ? 1 : 0;
         if (aPrio !== bPrio) {
-          return bPrio - aPrio; // Priority (1) before Regular (0)
+          return bPrio - aPrio;
         }
         return a.sequenceNumber - b.sequenceNumber;
       });
@@ -551,7 +576,7 @@ export default function App() {
       setIsStaffVerified(false);
       setStaffBannerMessage({
         type: 'info',
-        text: 'Signed out of Staff Console. Terminal is now in Public Kiosk / Display mode.',
+        text: 'Signed out of Staff Console.',
       });
     } catch (error) {
       console.error('Sign out error:', error);
@@ -607,7 +632,6 @@ export default function App() {
 
     const timeStr = formatCurrentTime();
     const isPrio = customerPriorityCategory !== 'Regular';
-    // Calculate how many people will be ahead of this customer in the priority-ordered queue
     const waitingAheadCount = isPrio
       ? waitingCustomers.filter((c) => c.isPriority).length
       : waitingCustomers.length;
@@ -733,9 +757,10 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // Requirement 4, 6, 7: Call Next Waiting Customer (Priority-aware sequential order)
+  // Requirement 4, 6, 7: Call Next Waiting Customer (Staff Page)
   const handleCallNextCustomer = async () => {
     if (!currentUser || !isStaffVerified) {
+      navigateToPage('staff');
       setShowStaffAuthBanner(true);
       setStaffBannerMessage({
         type: 'warning',
@@ -1133,12 +1158,13 @@ export default function App() {
     }
   };
 
-  // Dedicated Full-Screen TV / Monitor Public Display View
-  if (isTvDisplayMode) {
+  // ============================================================================
+  // PAGE 3: Dedicated Full-Screen TV / Monitor Public Display View ('tv')
+  // ============================================================================
+  if (activePage === 'tv') {
     const nextFiveWaiting = waitingCustomers.slice(0, 5);
     return (
       <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-6 sm:p-10 no-print">
-        {/* Top Bar for TV Monitor Display */}
         <header className="flex flex-wrap items-center justify-between gap-6 border-b border-slate-800 pb-5">
           <div>
             <div className="text-2xl font-bold tracking-tight text-white">
@@ -1183,7 +1209,7 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setIsTvDisplayMode(false)}
+              onClick={() => navigateToPage('kiosk')}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-white rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Minimize2 className="w-3.5 h-3.5" />
@@ -1192,7 +1218,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Main Split: Extra-Large Now Serving (Left 7 Cols) & Next 5 Waiting (Right 5 Cols) */}
         <div className="my-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1">
           {/* Now Serving Focal Box */}
           <div
@@ -1258,29 +1283,17 @@ export default function App() {
 
             <div className="pt-6 border-t border-slate-800 flex flex-wrap items-center justify-between gap-4 text-sm text-slate-400">
               <span>
-                Please proceed to the counter when your queue number is announced.
+                Please proceed to the counter when your queue number is
+                announced.
               </span>
-              {currentUser && isStaffVerified && currentlyServing && (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleRecallActiveCustomer}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 cursor-pointer"
-                  >
-                    <BellRing className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Recall Customer</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleCallNextCustomer}
-                    disabled={waitingCustomers.length === 0}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 disabled:opacity-40 cursor-pointer"
-                  >
-                    <PhoneCall className="w-3.5 h-3.5" />
-                    <span>Call Next</span>
-                  </button>
-                </div>
-              )}
+              <button
+                type="button"
+                onClick={() => navigateToPage('kiosk')}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 cursor-pointer"
+              >
+                <Ticket className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Go to Customer Kiosk Check-In</span>
+              </button>
             </div>
           </div>
 
@@ -1365,11 +1378,7 @@ export default function App() {
     >
       {/* Printable Thermal Receipt Slip (Hidden on screen, visible only during @media print) */}
       {lastIssuedTicket && (
-        <div
-          id="printable-ticket-slip"
-          className="hidden"
-          aria-hidden="true"
-        >
+        <div id="printable-ticket-slip" className="hidden" aria-hidden="true">
           <div className="text-center space-y-2 font-mono">
             <div className="text-xs font-bold tracking-widest">
               QUEUELINE OFFICIAL TICKET
@@ -1403,217 +1412,134 @@ export default function App() {
       <header className="no-print sticky top-0 z-30 flex items-center justify-between gap-8 px-6 lg:px-10 py-3.5 bg-white/95 backdrop-blur border-b border-slate-200">
         {/* Zone 1: Brand Title (one line, single text element) */}
         <a
-          href="#top"
+          href="#/kiosk"
+          onClick={(e) => {
+            e.preventDefault();
+            navigateToPage('kiosk');
+          }}
           className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
         >
           QueueLine
         </a>
 
-        {/* Zone 2: 5 concise single-line navigation links */}
-        <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600">
+        {/* Zone 2: Clean single-line page navigation links */}
+        <nav className="flex items-center gap-5 sm:gap-7 text-sm font-medium text-slate-600">
           <a
-            href="#live-display"
-            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+            href="#/kiosk"
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToPage('kiosk');
+            }}
+            className={`hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 ${
+              activePage === 'kiosk'
+                ? 'text-slate-900 font-semibold underline'
+                : ''
+            }`}
           >
-            Live Display
+            Customer Kiosk
           </a>
           <a
-            href="#join-queue"
-            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-          >
-            Join Queue
-          </a>
-          <a
-            href="#waiting-list"
-            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-          >
-            Waiting List
-          </a>
-          <a
-            href="#staff-console"
-            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+            href="#/staff"
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToPage('staff');
+            }}
+            className={`hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 ${
+              activePage === 'staff'
+                ? 'text-slate-900 font-semibold underline'
+                : ''
+            }`}
           >
             Staff Console
           </a>
-          <button
-            type="button"
-            onClick={() => setIsTvDisplayMode(true)}
-            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          <a
+            href="#/tv"
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToPage('tv');
+            }}
+            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
           >
             TV Monitor
-          </button>
+          </a>
         </nav>
 
         {/* Zone 3: 1 Primary Action Button */}
         <div className="flex items-center shrink-0">
-          <button
-            type="button"
-            onClick={handleCallNextCustomer}
-            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <PhoneCall className="w-3.5 h-3.5" />
-            <span>Call Next Customer</span>
-          </button>
+          {activePage === 'kiosk' ? (
+            <button
+              type="button"
+              onClick={() => navigateToPage('staff')}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Open Staff Console</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleCallNextCustomer}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <PhoneCall className="w-3.5 h-3.5" />
+              <span>Call Next Customer</span>
+            </button>
+          )}
         </div>
       </header>
 
       {/* Main Content Container (1440px desktop baseline) */}
       <main className="no-print flex-1 w-full max-w-[1360px] mx-auto px-6 lg:px-10 py-8 space-y-8">
-        {/* Section 1: Live Now Serving Focal Anchor + Key Queue Telemetry */}
-        <section id="live-display" className="space-y-4">
-          <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
-            <div>
-              <p className="text-xs font-medium text-slate-500">
-                Shared Facility Cloud Queue ({SHARED_FACILITY_ID}) ·{' '}
-                {isCloudConnected
-                  ? 'Live Multi-Device Sync Active'
-                  : 'Connecting to Cloud Firestore...'}{' '}
-                ·{' '}
-                {currentUser && isStaffVerified
-                  ? `Authorized Staff (${currentUser.email})`
-                  : 'Public Kiosk & Display Mode (No Sign-In Needed to Join)'}
-              </p>
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-0.5">
-                Live Counter Status &amp; Shared Queue Monitor
-              </h1>
-            </div>
 
-            {/* TV Display Mode, Voice Announcement, Audio Chime & Staff Auth Controls */}
-            <div className="flex flex-wrap items-center gap-2 self-start lg:self-auto">
-              <button
-                type="button"
-                onClick={() => setIsTvDisplayMode(true)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-900 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                title="Open distraction-free full-screen TV Monitor mode"
-              >
-                <Tv className="w-3.5 h-3.5 text-slate-700" />
-                <span>TV Display Mode</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setVoiceEnabled((prev) => !prev)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                title="Toggle Web Speech API voice announcements"
-              >
-                <Megaphone
-                  className={`w-3.5 h-3.5 ${
-                    voiceEnabled ? 'text-emerald-600' : 'text-slate-400'
-                  }`}
-                />
-                <span>{voiceEnabled ? 'Voice On' : 'Voice Muted'}</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setSoundEnabled((prev) => !prev)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                title="Toggle counter call chime"
-              >
-                {soundEnabled ? (
-                  <>
-                    <Volume2 className="w-3.5 h-3.5 text-slate-700" />
-                    <span>Chime On</span>
-                  </>
-                ) : (
-                  <>
-                    <VolumeX className="w-3.5 h-3.5 text-slate-400" />
-                    <span>Chime Muted</span>
-                  </>
-                )}
-              </button>
-
-              {isAuthReady && currentUser && isStaffVerified ? (
-                <button
-                  type="button"
-                  onClick={handleStaffSignOut}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  title="Signed in as Authorized Staff via Google"
-                >
-                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Staff Authorized ({currentUser.email})</span>
-                  <LogOut className="w-3 h-3 ml-1 text-emerald-700" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleGoogleStaffSignIn}
-                  disabled={isSigningIn}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-50 border border-amber-300 rounded-lg hover:bg-amber-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <LogIn className="w-3.5 h-3.5 text-amber-700" />
-                  <span>
-                    {isSigningIn
-                      ? 'Verifying Staff...'
-                      : 'Staff Sign In with Google'}
-                  </span>
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Staff Google Authentication Banner when unauthenticated user clicks a Staff control */}
-          {showStaffAuthBanner && (!currentUser || !isStaffVerified) && (
-            <div className="p-4 bg-white border border-amber-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div className="space-y-0.5">
-                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-                  <Lock className="w-4 h-4 text-amber-600" />
-                  <span>Authorized Staff Sign-In Required</span>
-                </div>
-                <p className="text-xs text-slate-600">
-                  Customers can view and join the shared queue freely without
-                  signing in. Calling, recalling, or changing ticket statuses
-                  requires an authorized Staff Google account.
+        {/* ==================================================================== */}
+        {/* PAGE 1: PUBLIC CUSTOMER KIOSK CHECK-IN PAGE (Customer-Only View)     */}
+        {/* ==================================================================== */}
+        {activePage === 'kiosk' && (
+          <div className="space-y-8">
+            <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+              <div>
+                <p className="text-xs font-medium text-slate-500">
+                  Public Self-Service Kiosk · No Login Required
                 </p>
+                <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-0.5">
+                  Customer Queue Check-In &amp; Live Waiting Board
+                </h1>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+
+              <div className="flex items-center gap-2 self-start sm:self-auto">
                 <button
                   type="button"
-                  onClick={handleGoogleStaffSignIn}
-                  disabled={isSigningIn}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={() => navigateToPage('tv')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span>
-                    {isSigningIn
-                      ? 'Signing In...'
-                      : 'Sign in with Google (Staff)'}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowStaffAuthBanner(false)}
-                  className="px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Dismiss
+                  <Tv className="w-3.5 h-3.5 text-slate-700" />
+                  <span>Open TV Monitor</span>
                 </button>
               </div>
             </div>
-          )}
 
-          {/* Dominant Visual Focal Anchor: Now Serving Board + Next Up */}
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch">
-              {/* Left 7 Cols: Currently Being Served (Requirement 6 + Recall Button) */}
-              <div
-                className={`lg:col-span-7 p-6 sm:p-8 flex flex-col justify-between text-white transition-colors duration-200 ${
-                  isFlashingNowServing ? 'bg-emerald-950' : 'bg-slate-900'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-xs font-medium tracking-wide text-slate-300">
-                    Now Serving at Service Counter
-                  </span>
-                  <span className="text-xs font-mono text-slate-400 tabular-nums">
-                    {currentlyServing
-                      ? `Called at ${currentlyServing.calledAt || currentlyServing.joinedAt}`
-                      : 'Counter Standby'}
-                  </span>
-                </div>
+            {/* Customer Kiosk Top Banner: Read-Only Now Serving Status & Queue Metrics */}
+            <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+              <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch">
+                {/* Left 7 Cols: Read-Only Currently Serving Display for Customers */}
+                <div
+                  className={`lg:col-span-7 p-6 sm:p-8 flex flex-col justify-between text-white transition-colors duration-200 ${
+                    isFlashingNowServing ? 'bg-emerald-950' : 'bg-slate-900'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-xs font-medium tracking-wide text-slate-300">
+                      Now Serving at Service Counter
+                    </span>
+                    <span className="text-xs font-mono text-slate-400 tabular-nums">
+                      {currentlyServing
+                        ? `Called at ${currentlyServing.calledAt || currentlyServing.joinedAt}`
+                        : 'Counter Standby'}
+                    </span>
+                  </div>
 
-                {currentlyServing ? (
-                  <div className="my-6 flex flex-col xl:flex-row xl:items-baseline justify-between gap-4">
-                    <div>
+                  {currentlyServing ? (
+                    <div className="my-6">
                       <div
                         className="text-5xl sm:text-6xl font-bold font-mono tracking-tight text-white tabular-nums"
                         data-testid="now-serving-number"
@@ -1628,10 +1554,6 @@ export default function App() {
                       </div>
                       <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 mt-1.5">
                         <span>{currentlyServing.purpose}</span>
-                        <span aria-hidden="true">·</span>
-                        <span className="font-mono tabular-nums">
-                          Joined {currentlyServing.joinedAt}
-                        </span>
                         {currentlyServing.isPriority &&
                           currentlyServing.priorityCategory && (
                             <>
@@ -1644,93 +1566,26 @@ export default function App() {
                               </span>
                             </>
                           )}
-                        {Boolean(currentlyServing.recallCount) && (
-                          <>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-mono text-emerald-300 tabular-nums">
-                              Recalled {currentlyServing.recallCount}x
-                              {currentlyServing.lastRecalledAt
-                                ? ` (${currentlyServing.lastRecalledAt})`
-                                : ''}
-                            </span>
-                          </>
-                        )}
                       </div>
                     </div>
-
-                    {/* Direct Staff Actions for the Active Customer (Including Recall / Ring Again) */}
-                    <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 xl:pt-0">
-                      <button
-                        type="button"
-                        onClick={handleRecallActiveCustomer}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-200 bg-slate-800 border border-amber-500/40 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                        title="Replay chime, announce on speaker, and flash display"
+                  ) : (
+                    <div className="my-8">
+                      <div
+                        className="text-4xl sm:text-5xl font-bold font-mono text-slate-400 tabular-nums"
+                        data-testid="now-serving-number"
                       >
-                        <BellRing className="w-3.5 h-3.5 text-amber-400" />
-                        <span>Recall / Ring Again</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleUpdateCustomerStatus(
-                            currentlyServing,
-                            QueueStatus.Served
-                          )
-                        }
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-emerald-400 rounded-lg hover:bg-emerald-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Mark Served</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleUpdateCustomerStatus(
-                            currentlyServing,
-                            QueueStatus.Skipped
-                          )
-                        }
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-800 border border-slate-700 rounded-lg hover:bg-rose-950 hover:border-rose-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      >
-                        <SkipForward className="w-3.5 h-3.5" />
-                        <span>Mark Skipped</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleUpdateCustomerStatus(
-                            currentlyServing,
-                            QueueStatus.Waiting
-                          )
-                        }
-                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800/70 rounded-lg hover:bg-slate-800 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      >
-                        <Clock className="w-3.5 h-3.5" />
-                        <span>Return to Waiting</span>
-                      </button>
+                        — — —
+                      </div>
+                      <p className="text-base font-medium text-slate-200 mt-2">
+                        Counter is ready for the next customer
+                      </p>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Enter your name below to get your queue ticket number.
+                      </p>
                     </div>
-                  </div>
-                ) : (
-                  <div className="my-8">
-                    <div
-                      className="text-4xl sm:text-5xl font-bold font-mono text-slate-400 tabular-nums"
-                      data-testid="now-serving-number"
-                    >
-                      — — —
-                    </div>
-                    <p className="text-base font-medium text-slate-200 mt-2">
-                      No customer is currently being served
-                    </p>
-                    <p className="text-xs text-slate-400 mt-1">
-                      {waitingCustomers.length > 0
-                        ? `${waitingCustomers.length} customer(s) waiting in line. Authorized staff can click "Call Next Customer" to serve ${waitingCustomers[0].queueCode}.`
-                        : 'The waiting line is currently empty. New customers can check in below without signing in.'}
-                    </p>
-                  </div>
-                )}
+                  )}
 
-                <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div className="text-xs text-slate-300">
+                  <div className="pt-4 border-t border-slate-800 flex items-center justify-between gap-3 text-xs text-slate-300">
                     {nextWaitingCustomer ? (
                       <span>
                         Next in waiting line:{' '}
@@ -1745,468 +1600,752 @@ export default function App() {
                         )
                       </span>
                     ) : (
-                      <span>No additional customers waiting in queue</span>
+                      <span>No customers currently waiting ahead</span>
                     )}
+                    <span className="font-mono text-slate-400 tabular-nums">
+                      Next Issue: Q-{String(nextSequence).padStart(3, '0')}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Right 5 Cols: Customer-Facing Summary Metrics */}
+                <div className="lg:col-span-5 grid grid-cols-2 divide-x divide-y divide-slate-200 bg-white">
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      People Waiting
+                    </span>
+                    <div className="mt-3">
+                      <div
+                        className="text-3xl font-bold font-mono text-amber-700 tabular-nums"
+                        data-testid="metric-waiting-count"
+                      >
+                        {counts.waiting}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1 tabular-nums">
+                        {counts.priorityWaiting} in Priority Lane
+                      </p>
+                    </div>
                   </div>
 
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Next Ticket Number
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-3xl font-bold font-mono text-slate-900 tabular-nums">
+                        Q-{String(nextSequence).padStart(3, '0')}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Auto-assigned on check-in
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Currently Serving
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-2xl font-bold font-mono text-emerald-700 tabular-nums">
+                        {currentlyServing ? currentlyServing.queueCode : 'Idle'}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Main Service Counter
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Served Today
+                    </span>
+                    <div className="mt-3">
+                      <div
+                        className="text-2xl font-bold font-mono text-slate-900 tabular-nums"
+                        data-testid="metric-served-count"
+                      >
+                        {counts.served}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Completed visits
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Customer Kiosk Main Split: Check-In Form (Left 6 Cols) & Live Waiting Queue (Right 6 Cols) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
+              {/* Left 6 Cols: Dedicated Public Customer Check-In Card */}
+              <div
+                id="join-queue"
+                className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-6 sm:p-8 flex flex-col justify-between"
+              >
+                <div>
+                  <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-4">
+                    <div>
+                      <h2 className="text-xl font-bold text-slate-900">
+                        Get Your Queue Ticket
+                      </h2>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Enter your full name and select your service purpose to
+                        join the line
+                      </p>
+                    </div>
+                    <span className="text-xs font-mono font-semibold text-slate-700 tabular-nums">
+                      Ticket Q-{String(nextSequence).padStart(3, '0')}
+                    </span>
+                  </div>
+
+                  <form onSubmit={handleJoinQueue} className="mt-6 space-y-5">
+                    <div>
+                      <label
+                        htmlFor="customer-name-input"
+                        className="block text-xs font-semibold text-slate-800 mb-1.5"
+                      >
+                        Your Full Name <span className="text-rose-600">*</span>
+                      </label>
+                      <input
+                        id="customer-name-input"
+                        type="text"
+                        maxLength={MAX_NAME_LENGTH}
+                        value={customerName}
+                        onChange={(e) => {
+                          setCustomerName(e.target.value);
+                          if (formError) setFormError(null);
+                        }}
+                        placeholder="e.g., Jordan Rivera"
+                        className="w-full px-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
+                      />
+                      {formError && (
+                        <p className="text-xs font-medium text-rose-600 mt-1.5">
+                          {formError}
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="customer-purpose-select"
+                        className="block text-xs font-semibold text-slate-800 mb-1.5"
+                      >
+                        Service Category
+                      </label>
+                      <select
+                        id="customer-purpose-select"
+                        value={customerPurpose}
+                        onChange={(e) => setCustomerPurpose(e.target.value)}
+                        className="w-full px-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
+                      >
+                        {SERVICE_PURPOSES.map((purpose) => (
+                          <option key={purpose} value={purpose}>
+                            {purpose}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="customer-priority-select"
+                        className="block text-xs font-semibold text-slate-800 mb-1.5"
+                      >
+                        Queue Lane / Priority Eligibility
+                      </label>
+                      <select
+                        id="customer-priority-select"
+                        value={customerPriorityCategory}
+                        onChange={(e) =>
+                          setCustomerPriorityCategory(
+                            e.target.value as PriorityCategory
+                          )
+                        }
+                        className="w-full px-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
+                      >
+                        {PRIORITY_CATEGORIES.map((cat) => (
+                          <option key={cat.id} value={cat.id}>
+                            {cat.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isJoiningQueue}
+                      className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer disabled:opacity-60"
+                    >
+                      <UserPlus className="w-4 h-4" />
+                      <span>
+                        {isJoiningQueue
+                          ? 'Assigning Queue Number...'
+                          : 'Join Queue & Get Ticket Number'}
+                      </span>
+                    </button>
+                  </form>
+                </div>
+
+                {/* Issued Ticket Confirmation & Print/Download Slip */}
+                <div className="mt-6 pt-5 border-t border-slate-200">
+                  {lastIssuedTicket ? (
+                    <div
+                      className="space-y-3"
+                      role="status"
+                      aria-live="polite"
+                      data-testid="issued-ticket-receipt"
+                    >
+                      <div className="flex items-center justify-between text-xs text-emerald-700 font-semibold">
+                        <span>Your Queue Ticket Is Ready</span>
+                        <span className="font-mono tabular-nums">
+                          Issued {lastIssuedTicket.joinedAt}
+                        </span>
+                      </div>
+                      <div className="flex items-baseline justify-between gap-4">
+                        <div>
+                          <div className="text-xs text-slate-500">
+                            Assigned Queue Number
+                          </div>
+                          <div className="text-3xl font-bold font-mono text-slate-900 tabular-nums">
+                            {lastIssuedTicket.queueCode}
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <div className="text-base font-semibold text-slate-900">
+                            {lastIssuedTicket.name}
+                          </div>
+                          <div className="text-xs text-slate-500">
+                            {lastIssuedTicket.isPriority
+                              ? `Priority (${lastIssuedTicket.priorityCategory})`
+                              : 'Regular Queue'}{' '}
+                            ·{' '}
+                            <span className="font-mono tabular-nums">
+                              {lastIssuedTicket.waitingAhead}
+                            </span>{' '}
+                            ahead of you
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-2">
+                        <button
+                          type="button"
+                          onClick={handlePrintTicketSlip}
+                          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                          <span>Print Ticket Slip</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadTicketSlip(lastIssuedTicket)
+                          }
+                          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Save Ticket (.txt)</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-500 space-y-1">
+                      <p className="font-medium text-slate-700">
+                        How Customer Check-In Works
+                      </p>
+                      <p>
+                        1. Enter your name and click{' '}
+                        <strong>Join Queue &amp; Get Ticket Number</strong>.
+                      </p>
+                      <p>
+                        2. Print or save your assigned queue code and watch the
+                        live waiting list on the right.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Right 6 Cols: Read-Only Customers Currently Waiting List (No Staff Action Buttons!) */}
+              <div
+                id="waiting-list"
+                className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-6 sm:p-8 flex flex-col justify-between"
+              >
+                <div>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-4">
+                    <div>
+                      <h2 className="text-xl font-bold text-slate-900">
+                        Customers Currently Waiting
+                      </h2>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Live waiting order · Priority Lane customers are served
+                        ahead in sequence
+                      </p>
+                    </div>
+                    <div className="text-xs font-medium text-slate-600 tabular-nums">
+                      <span className="font-mono font-bold text-slate-900">
+                        {waitingCustomers.length}
+                      </span>{' '}
+                      waiting
+                    </div>
+                  </div>
+
+                  {waitingCustomers.length > 0 ? (
+                    <div className="divide-y divide-slate-200 mt-2">
+                      {waitingCustomers.map((customer, index) => {
+                        const isNextUp = index === 0;
+                        return (
+                          <div
+                            key={customer.id}
+                            className="py-3.5 flex items-center justify-between gap-3"
+                          >
+                            <div className="flex items-center gap-4 min-w-0">
+                              <div className="w-8 text-xs font-mono font-semibold text-slate-400 tabular-nums shrink-0">
+                                #{index + 1}
+                              </div>
+                              <div className="text-base font-bold font-mono text-slate-900 tabular-nums shrink-0">
+                                {customer.queueCode}
+                              </div>
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-sm font-semibold text-slate-900 truncate">
+                                    {customer.name}
+                                  </span>
+                                  {customer.isPriority &&
+                                    customer.priorityCategory && (
+                                      <span className="inline-flex items-center gap-1 text-xs font-semibold text-rose-700 whitespace-nowrap">
+                                        <HeartHandshake className="w-3.5 h-3.5 shrink-0" />
+                                        <span>
+                                          Priority ({customer.priorityCategory})
+                                        </span>
+                                      </span>
+                                    )}
+                                  {isNextUp && (
+                                    <span className="text-xs font-semibold text-amber-700 whitespace-nowrap">
+                                      · Next in line
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-2 text-xs text-slate-500">
+                                  <span className="truncate">
+                                    {customer.purpose}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="font-mono tabular-nums">
+                                    Joined {customer.joinedAt}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="shrink-0">
+                              {renderStatusText(customer.status)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="py-16 text-center space-y-2">
+                      <p className="text-sm font-semibold text-slate-800">
+                        No customers are currently waiting
+                      </p>
+                      <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                        You will be first in line! Fill out the check-in form on
+                        the left to get your ticket number.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-6 pt-4 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
+                  <span>
+                    Please listen for your queue number announcement at the
+                    counter.
+                  </span>
+                  <span className="font-mono tabular-nums">
+                    Priority Waiting: {counts.priorityWaiting}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ==================================================================== */}
+        {/* PAGE 2: AUTHORIZED STAFF CONSOLE PAGE (Staff Queue Management View)  */}
+        {/* ==================================================================== */}
+        {activePage === 'staff' && (
+          <div className="space-y-8">
+            <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+              <div>
+                <p className="text-xs font-medium text-slate-500">
+                  Authorized Staff Workspace ·{' '}
+                  {currentUser && isStaffVerified
+                    ? `Signed in as ${currentUser.email}`
+                    : 'Staff Google Sign-In Required for Mutations'}
+                </p>
+                <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-0.5">
+                  Staff Counter Control &amp; Queue Management
+                </h1>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 self-start lg:self-auto">
+                <button
+                  type="button"
+                  onClick={() => navigateToPage('kiosk')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Ticket className="w-3.5 h-3.5 text-slate-700" />
+                  <span>Switch to Customer Kiosk</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setVoiceEnabled((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Megaphone
+                    className={`w-3.5 h-3.5 ${
+                      voiceEnabled ? 'text-emerald-600' : 'text-slate-400'
+                    }`}
+                  />
+                  <span>{voiceEnabled ? 'Voice On' : 'Voice Muted'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSoundEnabled((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {soundEnabled ? (
+                    <>
+                      <Volume2 className="w-3.5 h-3.5 text-slate-700" />
+                      <span>Chime On</span>
+                    </>
+                  ) : (
+                    <>
+                      <VolumeX className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Chime Muted</span>
+                    </>
+                  )}
+                </button>
+
+                {isAuthReady && currentUser && isStaffVerified ? (
                   <button
                     type="button"
-                    onClick={handleCallNextCustomer}
-                    disabled={waitingCustomers.length === 0}
-                    className={`inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
-                      waitingCustomers.length > 0
-                        ? 'bg-white text-slate-900 hover:bg-slate-100 cursor-pointer'
-                        : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                    }`}
+                    onClick={handleStaffSignOut}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <PhoneCall className="w-3.5 h-3.5" />
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Staff Authorized ({currentUser.email})</span>
+                    <LogOut className="w-3 h-3 ml-1 text-emerald-700" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleGoogleStaffSignIn}
+                    disabled={isSigningIn}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-50 border border-amber-300 rounded-lg hover:bg-amber-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <LogIn className="w-3.5 h-3.5 text-amber-700" />
                     <span>
-                      {waitingCustomers.length > 0
-                        ? `Call Next (${waitingCustomers[0].queueCode})`
-                        : 'No Waiting Customers'}
+                      {isSigningIn
+                        ? 'Verifying Staff...'
+                        : 'Staff Sign In with Google'}
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Staff Sign-In Callout when not yet authenticated */}
+            {(showStaffAuthBanner || !currentUser || !isStaffVerified) && (
+              <div className="p-5 bg-white border border-amber-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <Lock className="w-4 h-4 text-amber-600" />
+                    <span>Staff Authentication Required for Counter Actions</span>
+                  </div>
+                  <p className="text-xs text-slate-600">
+                    Sign in with your Google account to unlock calling the next
+                    customer, recalling active tickets, and changing customer
+                    statuses on the shared Cloud Firestore queue.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleGoogleStaffSignIn}
+                    disabled={isSigningIn}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <LogIn className="w-3.5 h-3.5" />
+                    <span>
+                      {isSigningIn
+                        ? 'Signing In...'
+                        : 'Sign in with Google (Staff)'}
                     </span>
                   </button>
                 </div>
               </div>
+            )}
 
-              {/* Right 5 Cols: Real-Time Queue Summary Metrics (4-Metric Grid) */}
-              <div className="lg:col-span-5 grid grid-cols-2 divide-x divide-y divide-slate-200 bg-white">
-                <div className="p-6 flex flex-col justify-between">
-                  <span className="text-xs font-medium text-slate-500">
-                    Currently Waiting
-                  </span>
-                  <div className="mt-3">
-                    <div
-                      className="text-3xl font-bold font-mono text-amber-700 tabular-nums"
-                      data-testid="metric-waiting-count"
-                    >
-                      {counts.waiting}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1 tabular-nums">
-                      {counts.priorityWaiting} in Priority Lane
-                    </p>
-                  </div>
-                </div>
-
-                <div className="p-6 flex flex-col justify-between">
-                  <span className="text-xs font-medium text-slate-500">
-                    Currently Serving
-                  </span>
-                  <div className="mt-3">
-                    <div className="text-3xl font-bold font-mono text-emerald-700 tabular-nums">
-                      {counts.serving}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      {currentlyServing
-                        ? `${currentlyServing.queueCode} active`
-                        : 'Counter idle'}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="p-6 flex flex-col justify-between">
-                  <span className="text-xs font-medium text-slate-500">
-                    Served Today
-                  </span>
-                  <div className="mt-3">
-                    <div
-                      className="text-3xl font-bold font-mono text-slate-900 tabular-nums"
-                      data-testid="metric-served-count"
-                    >
-                      {counts.served}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Completed &amp; closed
-                    </p>
-                  </div>
-                </div>
-
-                <div className="p-6 flex flex-col justify-between">
-                  <span className="text-xs font-medium text-slate-500">
-                    Skipped Tickets
-                  </span>
-                  <div className="mt-3">
-                    <div
-                      className="text-3xl font-bold font-mono text-rose-700 tabular-nums"
-                      data-testid="metric-skipped-count"
-                    >
-                      {counts.skipped}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Excluded from auto-call
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Section 2: Two-Column Split — Public Customer Kiosk (Left) & Shared Waiting List (Right) */}
-        <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          {/* Left 5 Columns: Public Customer Kiosk Check-In Form (With Priority Lane + Printable Slip) */}
-          <div
-            id="join-queue"
-            className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 sm:p-7 flex flex-col justify-between"
-          >
-            <div>
-              <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-4">
-                <div>
-                  <h2 className="text-lg font-bold text-slate-900">
-                    Public Customer Kiosk Check-In
-                  </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Open to all visitors · Select Regular or Priority Lane
-                  </p>
-                </div>
-                <span className="text-xs font-mono font-semibold text-slate-700 tabular-nums">
-                  Next Ticket: Q-{String(nextSequence).padStart(3, '0')}
-                </span>
-              </div>
-
-              <form onSubmit={handleJoinQueue} className="mt-5 space-y-4">
-                <div>
-                  <label
-                    htmlFor="customer-name-input"
-                    className="block text-xs font-semibold text-slate-800 mb-1.5"
-                  >
-                    Customer Full Name <span className="text-rose-600">*</span>
-                  </label>
-                  <input
-                    id="customer-name-input"
-                    type="text"
-                    maxLength={MAX_NAME_LENGTH}
-                    value={customerName}
-                    onChange={(e) => {
-                      setCustomerName(e.target.value);
-                      if (formError) setFormError(null);
-                    }}
-                    placeholder="e.g., Jordan Rivera"
-                    className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
-                  />
-                  {formError && (
-                    <p className="text-xs font-medium text-rose-600 mt-1.5">
-                      {formError}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label
-                    htmlFor="customer-purpose-select"
-                    className="block text-xs font-semibold text-slate-800 mb-1.5"
-                  >
-                    Service Category
-                  </label>
-                  <select
-                    id="customer-purpose-select"
-                    value={customerPurpose}
-                    onChange={(e) => setCustomerPurpose(e.target.value)}
-                    className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
-                  >
-                    {SERVICE_PURPOSES.map((purpose) => (
-                      <option key={purpose} value={purpose}>
-                        {purpose}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Priority / Senior / PWD Lane Selector */}
-                <div>
-                  <label
-                    htmlFor="customer-priority-select"
-                    className="block text-xs font-semibold text-slate-800 mb-1.5"
-                  >
-                    Queue Lane / Priority Eligibility
-                  </label>
-                  <select
-                    id="customer-priority-select"
-                    value={customerPriorityCategory}
-                    onChange={(e) =>
-                      setCustomerPriorityCategory(
-                        e.target.value as PriorityCategory
-                      )
-                    }
-                    className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
-                  >
-                    {PRIORITY_CATEGORIES.map((cat) => (
-                      <option key={cat.id} value={cat.id}>
-                        {cat.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isJoiningQueue}
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer disabled:opacity-60"
-                >
-                  <UserPlus className="w-4 h-4" />
-                  <span>
-                    {isJoiningQueue
-                      ? 'Assigning Ticket...'
-                      : 'Join Shared Queue & Issue Number'}
-                  </span>
-                </button>
-              </form>
-            </div>
-
-            {/* Issued Ticket Receipt Feedback + Print / Download Slip */}
-            <div className="mt-6 pt-5 border-t border-slate-200">
-              {lastIssuedTicket ? (
+            {/* Staff Active Counter Control Board */}
+            <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+              <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch">
+                {/* Left 7 Cols: Active Customer Controls (Call Next, Recall, Mark Served/Skipped) */}
                 <div
-                  className="space-y-3"
-                  role="status"
-                  aria-live="polite"
-                  data-testid="issued-ticket-receipt"
+                  className={`lg:col-span-7 p-6 sm:p-8 flex flex-col justify-between text-white transition-colors duration-200 ${
+                    isFlashingNowServing ? 'bg-emerald-950' : 'bg-slate-900'
+                  }`}
                 >
-                  <div className="flex items-center justify-between text-xs text-emerald-700 font-semibold">
-                    <span>Shared Facility Ticket Issued</span>
-                    <span className="font-mono tabular-nums">
-                      {lastIssuedTicket.joinedAt}
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-xs font-medium tracking-wide text-slate-300">
+                      Active Counter Terminal · Now Serving
+                    </span>
+                    <span className="text-xs font-mono text-slate-400 tabular-nums">
+                      {currentlyServing
+                        ? `Called at ${currentlyServing.calledAt || currentlyServing.joinedAt}`
+                        : 'Counter Standby'}
                     </span>
                   </div>
-                  <div className="flex items-baseline justify-between gap-4">
-                    <div>
-                      <div className="text-xs text-slate-500">
-                        Assigned Queue Number
+
+                  {currentlyServing ? (
+                    <div className="my-6 flex flex-col xl:flex-row xl:items-baseline justify-between gap-4">
+                      <div>
+                        <div
+                          className="text-5xl sm:text-6xl font-bold font-mono tracking-tight text-white tabular-nums"
+                          data-testid="now-serving-number"
+                        >
+                          {currentlyServing.queueCode}
+                        </div>
+                        <div
+                          className="text-xl sm:text-2xl font-semibold text-slate-100 mt-2"
+                          data-testid="now-serving-name"
+                        >
+                          {currentlyServing.name}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 mt-1.5">
+                          <span>{currentlyServing.purpose}</span>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono tabular-nums">
+                            Joined {currentlyServing.joinedAt}
+                          </span>
+                          {currentlyServing.isPriority &&
+                            currentlyServing.priorityCategory && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="inline-flex items-center gap-1 font-semibold text-amber-300">
+                                  <HeartHandshake className="w-3.5 h-3.5" />
+                                  <span>
+                                    Priority ({currentlyServing.priorityCategory})
+                                  </span>
+                                </span>
+                              </>
+                            )}
+                          {Boolean(currentlyServing.recallCount) && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono text-emerald-300 tabular-nums">
+                                Recalled {currentlyServing.recallCount}x
+                              </span>
+                            </>
+                          )}
+                        </div>
                       </div>
-                      <div className="text-2xl font-bold font-mono text-slate-900 tabular-nums">
-                        {lastIssuedTicket.queueCode}
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 xl:pt-0">
+                        <button
+                          type="button"
+                          onClick={handleRecallActiveCustomer}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-200 bg-slate-800 border border-amber-500/40 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <BellRing className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Recall / Ring Again</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUpdateCustomerStatus(
+                              currentlyServing,
+                              QueueStatus.Served
+                            )
+                          }
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-emerald-400 rounded-lg hover:bg-emerald-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Mark Served</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUpdateCustomerStatus(
+                              currentlyServing,
+                              QueueStatus.Skipped
+                            )
+                          }
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-800 border border-slate-700 rounded-lg hover:bg-rose-950 hover:border-rose-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <SkipForward className="w-3.5 h-3.5" />
+                          <span>Mark Skipped</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUpdateCustomerStatus(
+                              currentlyServing,
+                              QueueStatus.Waiting
+                            )
+                          }
+                          className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800/70 rounded-lg hover:bg-slate-800 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <Clock className="w-3.5 h-3.5" />
+                          <span>Return to Waiting</span>
+                        </button>
                       </div>
                     </div>
-                    <div className="text-right">
-                      <div className="text-sm font-semibold text-slate-900">
-                        {lastIssuedTicket.name}
+                  ) : (
+                    <div className="my-8">
+                      <div
+                        className="text-4xl sm:text-5xl font-bold font-mono text-slate-400 tabular-nums"
+                        data-testid="now-serving-number"
+                      >
+                        — — —
                       </div>
-                      <div className="text-xs text-slate-500">
-                        {lastIssuedTicket.isPriority
-                          ? `Priority (${lastIssuedTicket.priorityCategory})`
-                          : 'Regular Queue'}{' '}
-                        ·{' '}
-                        <span className="font-mono tabular-nums">
-                          {lastIssuedTicket.waitingAhead}
-                        </span>{' '}
-                        ahead
+                      <p className="text-base font-medium text-slate-200 mt-2">
+                        No customer is currently being served
+                      </p>
+                      <p className="text-xs text-slate-400 mt-1">
+                        {waitingCustomers.length > 0
+                          ? `${waitingCustomers.length} customer(s) waiting. Click "Call Next" to serve ${waitingCustomers[0].queueCode}.`
+                          : 'The waiting line is currently empty.'}
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="text-xs text-slate-300">
+                      {nextWaitingCustomer ? (
+                        <span>
+                          Next in waiting line:{' '}
+                          <strong className="font-mono text-white tabular-nums">
+                            {nextWaitingCustomer.queueCode}
+                          </strong>{' '}
+                          ({nextWaitingCustomer.name}
+                          {nextWaitingCustomer.isPriority &&
+                          nextWaitingCustomer.priorityCategory
+                            ? ` · Priority: ${nextWaitingCustomer.priorityCategory}`
+                            : ''}
+                          )
+                        </span>
+                      ) : (
+                        <span>No additional customers waiting in queue</span>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleCallNextCustomer}
+                      disabled={waitingCustomers.length === 0}
+                      className={`inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                        waitingCustomers.length > 0
+                          ? 'bg-white text-slate-900 hover:bg-slate-100 cursor-pointer'
+                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      <PhoneCall className="w-3.5 h-3.5" />
+                      <span>
+                        {waitingCustomers.length > 0
+                          ? `Call Next (${waitingCustomers[0].queueCode})`
+                          : 'No Waiting Customers'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Right 5 Cols: Staff Metrics */}
+                <div className="lg:col-span-5 grid grid-cols-2 divide-x divide-y divide-slate-200 bg-white">
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Currently Waiting
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-3xl font-bold font-mono text-amber-700 tabular-nums">
+                        {counts.waiting}
                       </div>
+                      <p className="text-xs text-slate-500 mt-1 tabular-nums">
+                        {counts.priorityWaiting} Priority ·{' '}
+                        {counts.waiting - counts.priorityWaiting} Regular
+                      </p>
                     </div>
                   </div>
 
-                  {/* Print Ticket & Save Ticket Actions */}
-                  <div className="flex items-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={handlePrintTicketSlip}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
-                    >
-                      <Printer className="w-3.5 h-3.5" />
-                      <span>Print Ticket Slip</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDownloadTicketSlip(lastIssuedTicket)}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Save Ticket (.txt)</span>
-                    </button>
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Currently Serving
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-3xl font-bold font-mono text-emerald-700 tabular-nums">
+                        {counts.serving}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        {currentlyServing
+                          ? `${currentlyServing.queueCode} active`
+                          : 'Counter idle'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Served Today
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-3xl font-bold font-mono text-slate-900 tabular-nums">
+                        {counts.served}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Completed &amp; closed
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-6 flex flex-col justify-between">
+                    <span className="text-xs font-medium text-slate-500">
+                      Skipped Tickets
+                    </span>
+                    <div className="mt-3">
+                      <div className="text-3xl font-bold font-mono text-rose-700 tabular-nums">
+                        {counts.skipped}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Excluded from auto-call
+                      </p>
+                    </div>
                   </div>
                 </div>
-              ) : (
-                <div className="text-xs text-slate-500 space-y-1">
-                  <p className="font-medium text-slate-700">
-                    Printable Ticket &amp; Priority Lane Support
-                  </p>
-                  <p>
-                    After joining, customers can print a thermal receipt slip or
-                    save their ticket to their phone. Senior Citizen, PWD,
-                    Pregnant, and Emergency tickets are prioritized automatically.
-                  </p>
-                </div>
-              )}
+              </div>
             </div>
-          </div>
 
-          {/* Right 7 Columns: Customers Currently Waiting List (Requirement 3 + Priority Ordering) */}
-          <div
-            id="waiting-list"
-            className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 sm:p-7 flex flex-col justify-between"
-          >
-            <div>
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-4">
+            {/* Staff Queue Management Table & Controls */}
+            <section
+              id="staff-console"
+              className="bg-white border border-slate-200 rounded-xl p-6 sm:p-7 space-y-5"
+            >
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-5">
                 <div>
                   <h2 className="text-lg font-bold text-slate-900">
-                    Customers Currently Waiting
+                    All Queue Tickets &amp; Status Management
                   </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Priority Lane tickets are ordered ahead of Regular tickets while preserving arrival sequence
+                  <p className="text-xs text-slate-500 mt-1">
+                    Mark customers as Waiting, Serving, Served, or Skipped.
+                    Already Served or Skipped customers are prevented from being
+                    called as the next active customer.
                   </p>
                 </div>
-                <div className="text-xs font-medium text-slate-600 tabular-nums">
-                  <span className="font-mono font-bold text-slate-900">
-                    {waitingCustomers.length}
-                  </span>{' '}
-                  waiting ({counts.priorityWaiting} priority)
-                </div>
-              </div>
 
-              {waitingCustomers.length > 0 ? (
-                <div className="divide-y divide-slate-200 mt-2">
-                  {waitingCustomers.map((customer, index) => {
-                    const isNextUp = index === 0;
-                    return (
-                      <div
-                        key={customer.id}
-                        className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50/80 transition-colors px-2 -mx-2 rounded-lg"
-                      >
-                        <div className="flex items-center gap-4 min-w-0">
-                          <div className="w-8 text-xs font-mono font-semibold text-slate-400 tabular-nums shrink-0">
-                            #{index + 1}
-                          </div>
-                          <div className="text-base font-bold font-mono text-slate-900 tabular-nums shrink-0">
-                            {customer.queueCode}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-sm font-semibold text-slate-900 truncate">
-                                {customer.name}
-                              </span>
-                              {customer.isPriority &&
-                                customer.priorityCategory && (
-                                  <span className="inline-flex items-center gap-1 text-xs font-semibold text-rose-700 whitespace-nowrap">
-                                    <HeartHandshake className="w-3.5 h-3.5 shrink-0" />
-                                    <span>
-                                      Priority ({customer.priorityCategory})
-                                    </span>
-                                  </span>
-                                )}
-                              {isNextUp && (
-                                <span className="text-xs font-semibold text-amber-700 whitespace-nowrap">
-                                  · Next to be called
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2 text-xs text-slate-500">
-                              <span className="truncate">
-                                {customer.purpose}
-                              </span>
-                              <span aria-hidden="true">·</span>
-                              <span className="font-mono tabular-nums">
-                                Joined {customer.joinedAt}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Quick Staff Action on Waiting List Item */}
-                        <div className="flex items-center gap-3 self-end sm:self-center shrink-0">
-                          {renderStatusText(customer.status)}
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleUpdateCustomerStatus(
-                                customer,
-                                QueueStatus.Serving
-                              )
-                            }
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 rounded-md hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                            title={`Call ${customer.queueCode} now (Staff only)`}
-                          >
-                            <span>Call</span>
-                            <ArrowRight className="w-3 h-3" />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                /* Empty Waiting Queue State */
-                <div className="py-12 text-center space-y-3">
-                  <p className="text-sm font-semibold text-slate-800">
-                    No customers are currently waiting
-                  </p>
-                  <p className="text-xs text-slate-500 max-w-md mx-auto">
-                    All issued queue numbers have been served or skipped. Use
-                    the Public Customer Kiosk Check-In form to add the next
-                    arriving customer.
-                  </p>
-                  <div className="pt-1">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const input = document.getElementById(
-                          'customer-name-input'
-                        );
-                        if (input) input.focus();
-                      }}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
-                    >
-                      <UserPlus className="w-3.5 h-3.5" />
-                      <span>Focus Customer Check-In</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="mt-4 pt-4 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
-              <span>
-                Only customers with <strong>Waiting</strong> status appear here
-                and are eligible for next call.
-              </span>
-              <span className="font-mono tabular-nums">
-                Total Shared Records: {counts.total}
-              </span>
-            </div>
-          </div>
-        </section>
-
-        {/* Section 3: Authorized Staff Queue Management Console (Req 4, 5, 7 + Priority Toggle) */}
-        <section
-          id="staff-console"
-          className="bg-white border border-slate-200 rounded-xl p-6 sm:p-7 space-y-5"
-        >
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-5">
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-lg font-bold text-slate-900">
-                  Authorized Staff Queue Management Console
-                </h2>
-                <span className="text-xs text-slate-500">
-                  ·{' '}
-                  {currentUser && isStaffVerified
-                    ? `Verified Staff (${currentUser.email})`
-                    : 'Staff Sign-In Required for Mutations'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 mt-1">
-                Manage all shared queue tickets across Waiting, Serving, Served,
-                and Skipped states, recall active customers, or toggle Priority
-                Lane eligibility.
-              </p>
-            </div>
-
-            {/* Staff Primary Actions */}
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              {!currentUser || !isStaffVerified ? (
-                <button
-                  type="button"
-                  onClick={handleGoogleStaffSignIn}
-                  disabled={isSigningIn}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span>
-                    {isSigningIn
-                      ? 'Signing In...'
-                      : 'Sign in with Google to Manage Queue'}
-                  </span>
-                </button>
-              ) : (
-                <>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
                   <button
                     type="button"
                     onClick={handleCallNextCustomer}
@@ -2238,370 +2377,378 @@ export default function App() {
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Clear Queue</span>
                   </button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Staff Operational Feedback Banner */}
-          {staffBannerMessage && (
-            <div
-              className={`px-4 py-3 rounded-lg border flex items-center justify-between gap-4 text-xs ${
-                staffBannerMessage.type === 'warning'
-                  ? 'bg-amber-50 border-amber-200 text-amber-900'
-                  : staffBannerMessage.type === 'success'
-                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                  : 'bg-slate-50 border-slate-200 text-slate-800'
-              }`}
-              role="status"
-            >
-              <div className="flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span className="font-medium">{staffBannerMessage.text}</span>
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setStaffBannerMessage(null)}
-                className="text-xs font-semibold underline hover:no-underline whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
 
-          {/* Filter Tabs & Search Bar */}
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            {/* Functional Segmented Filter Buttons */}
-            <div
-              className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg self-start"
-              role="group"
-              aria-label="Filter queue by status"
-            >
-              {(
-                [
-                  { id: 'ALL', label: `All (${counts.total})` },
-                  {
-                    id: QueueStatus.Waiting,
-                    label: `Waiting (${counts.waiting})`,
-                  },
-                  {
-                    id: QueueStatus.Serving,
-                    label: `Serving (${counts.serving})`,
-                  },
-                  {
-                    id: QueueStatus.Served,
-                    label: `Served (${counts.served})`,
-                  },
-                  {
-                    id: QueueStatus.Skipped,
-                    label: `Skipped (${counts.skipped})`,
-                  },
-                ] as const
-              ).map((tab) => {
-                const active = statusFilter === tab.id;
-                return (
+              {staffBannerMessage && (
+                <div
+                  className={`px-4 py-3 rounded-lg border flex items-center justify-between gap-4 text-xs ${
+                    staffBannerMessage.type === 'warning'
+                      ? 'bg-amber-50 border-amber-200 text-amber-900'
+                      : staffBannerMessage.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                      : 'bg-slate-50 border-slate-200 text-slate-800'
+                  }`}
+                  role="status"
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span className="font-medium">
+                      {staffBannerMessage.text}
+                    </span>
+                  </div>
                   <button
-                    key={tab.id}
                     type="button"
-                    onClick={() => setStatusFilter(tab.id)}
-                    className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 tabular-nums cursor-pointer ${
-                      active
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
+                    onClick={() => setStaffBannerMessage(null)}
+                    className="text-xs font-semibold underline hover:no-underline whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    {tab.label}
+                    Dismiss
                   </button>
-                );
-              })}
-            </div>
+                </div>
+              )}
 
-            {/* Search Input */}
-            <div className="relative w-full md:w-72">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search queue #, name, or priority..."
-                aria-label="Search queue number or customer name"
-                className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900"
-              />
-            </div>
-          </div>
-
-          {/* High-Density Queue Data Table */}
-          <div className="overflow-x-auto border border-slate-200 rounded-lg">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                  <th className="py-3 px-4 whitespace-nowrap">Queue #</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Customer Name</th>
-                  <th className="py-3 px-4 whitespace-nowrap">
-                    Lane &amp; Category
-                  </th>
-                  <th className="py-3 px-4 whitespace-nowrap">Timestamps</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Current Status</th>
-                  <th className="py-3 px-4 text-right whitespace-nowrap">
-                    Staff Status &amp; Priority Controls
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200 text-sm">
-                {filteredStaffCustomers.length > 0 ? (
-                  filteredStaffCustomers.map((customer) => {
-                    const isServedOrSkipped =
-                      customer.status === QueueStatus.Served ||
-                      customer.status === QueueStatus.Skipped;
-
+              {/* Filter Tabs & Search Bar */}
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div
+                  className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg self-start"
+                  role="group"
+                  aria-label="Filter queue by status"
+                >
+                  {(
+                    [
+                      { id: 'ALL', label: `All (${counts.total})` },
+                      {
+                        id: QueueStatus.Waiting,
+                        label: `Waiting (${counts.waiting})`,
+                      },
+                      {
+                        id: QueueStatus.Serving,
+                        label: `Serving (${counts.serving})`,
+                      },
+                      {
+                        id: QueueStatus.Served,
+                        label: `Served (${counts.served})`,
+                      },
+                      {
+                        id: QueueStatus.Skipped,
+                        label: `Skipped (${counts.skipped})`,
+                      },
+                    ] as const
+                  ).map((tab) => {
+                    const active = statusFilter === tab.id;
                     return (
-                      <tr
-                        key={customer.id}
-                        className={`transition-colors ${
-                          customer.status === QueueStatus.Serving
-                            ? 'bg-emerald-50/40 hover:bg-emerald-50/70'
-                            : 'hover:bg-slate-50'
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setStatusFilter(tab.id)}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 tabular-nums cursor-pointer ${
+                          active
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
                         }`}
                       >
-                        <td className="py-3 px-4 font-mono font-bold text-slate-900 tabular-nums whitespace-nowrap">
-                          {customer.queueCode}
-                        </td>
-                        <td className="py-3 px-4 font-semibold text-slate-900 whitespace-nowrap">
-                          {customer.name}
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-600 whitespace-nowrap">
-                          <span>{customer.purpose}</span>
-                          <span aria-hidden="true"> · </span>
-                          {customer.isPriority ? (
-                            <span className="font-semibold text-rose-700">
-                              Priority ({customer.priorityCategory || 'Senior Citizen'})
-                            </span>
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="relative w-full md:w-72">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search queue #, name, or priority..."
+                    aria-label="Search queue number or customer name"
+                    className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900"
+                  />
+                </div>
+              </div>
+
+              {/* High-Density Queue Data Table */}
+              <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                      <th className="py-3 px-4 whitespace-nowrap">Queue #</th>
+                      <th className="py-3 px-4 whitespace-nowrap">
+                        Customer Name
+                      </th>
+                      <th className="py-3 px-4 whitespace-nowrap">
+                        Lane &amp; Category
+                      </th>
+                      <th className="py-3 px-4 whitespace-nowrap">Timestamps</th>
+                      <th className="py-3 px-4 whitespace-nowrap">
+                        Current Status
+                      </th>
+                      <th className="py-3 px-4 text-right whitespace-nowrap">
+                        Staff Status &amp; Priority Controls
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 text-sm">
+                    {filteredStaffCustomers.length > 0 ? (
+                      filteredStaffCustomers.map((customer) => {
+                        const isServedOrSkipped =
+                          customer.status === QueueStatus.Served ||
+                          customer.status === QueueStatus.Skipped;
+
+                        return (
+                          <tr
+                            key={customer.id}
+                            className={`transition-colors ${
+                              customer.status === QueueStatus.Serving
+                                ? 'bg-emerald-50/40 hover:bg-emerald-50/70'
+                                : 'hover:bg-slate-50'
+                            }`}
+                          >
+                            <td className="py-3 px-4 font-mono font-bold text-slate-900 tabular-nums whitespace-nowrap">
+                              {customer.queueCode}
+                            </td>
+                            <td className="py-3 px-4 font-semibold text-slate-900 whitespace-nowrap">
+                              {customer.name}
+                            </td>
+                            <td className="py-3 px-4 text-xs text-slate-600 whitespace-nowrap">
+                              <span>{customer.purpose}</span>
+                              <span aria-hidden="true"> · </span>
+                              {customer.isPriority ? (
+                                <span className="font-semibold text-rose-700">
+                                  Priority (
+                                  {customer.priorityCategory || 'Senior Citizen'})
+                                </span>
+                              ) : (
+                                <span className="text-slate-500">Regular</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 text-xs text-slate-500 font-mono tabular-nums whitespace-nowrap">
+                              <span>In {customer.joinedAt}</span>
+                              {customer.calledAt && (
+                                <>
+                                  <span aria-hidden="true"> · </span>
+                                  <span>Called {customer.calledAt}</span>
+                                </>
+                              )}
+                              {Boolean(customer.recallCount) && (
+                                <>
+                                  <span aria-hidden="true"> · </span>
+                                  <span>Recalled {customer.recallCount}x</span>
+                                </>
+                              )}
+                              {customer.completedAt && (
+                                <>
+                                  <span aria-hidden="true"> · </span>
+                                  <span>Done {customer.completedAt}</span>
+                                </>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 whitespace-nowrap">
+                              {renderStatusText(customer.status)}
+                            </td>
+                            <td className="py-3 px-4 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleCustomerPriority(customer)
+                                  }
+                                  className={`px-2 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                    customer.isPriority
+                                      ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
+                                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {customer.isPriority
+                                    ? 'Priority ★'
+                                    : 'Set Priority'}
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleUpdateCustomerStatus(
+                                      customer,
+                                      QueueStatus.Waiting
+                                    )
+                                  }
+                                  disabled={
+                                    customer.status === QueueStatus.Waiting
+                                  }
+                                  className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                                    customer.status === QueueStatus.Waiting
+                                      ? 'bg-amber-600 text-white border-amber-600 font-semibold cursor-default'
+                                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 cursor-pointer'
+                                  }`}
+                                >
+                                  Waiting
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleUpdateCustomerStatus(
+                                      customer,
+                                      QueueStatus.Serving
+                                    )
+                                  }
+                                  disabled={
+                                    customer.status === QueueStatus.Serving ||
+                                    isServedOrSkipped
+                                  }
+                                  title={
+                                    isServedOrSkipped
+                                      ? 'Already Served or Skipped customers cannot be called directly as the active customer. Mark as Waiting first to re-queue.'
+                                      : 'Call and mark customer as Serving'
+                                  }
+                                  className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                                    customer.status === QueueStatus.Serving
+                                      ? 'bg-emerald-600 text-white border-emerald-600 font-semibold cursor-default'
+                                      : isServedOrSkipped
+                                      ? 'bg-slate-50 text-slate-300 border-slate-200 cursor-not-allowed'
+                                      : 'bg-white text-slate-700 border-slate-200 hover:bg-emerald-50 hover:text-emerald-800 hover:border-emerald-300 cursor-pointer'
+                                  }`}
+                                >
+                                  Serving
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleUpdateCustomerStatus(
+                                      customer,
+                                      QueueStatus.Served
+                                    )
+                                  }
+                                  disabled={
+                                    customer.status === QueueStatus.Served
+                                  }
+                                  className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                                    customer.status === QueueStatus.Served
+                                      ? 'bg-slate-800 text-white border-slate-800 font-semibold cursor-default'
+                                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 cursor-pointer'
+                                  }`}
+                                >
+                                  Served
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleUpdateCustomerStatus(
+                                      customer,
+                                      QueueStatus.Skipped
+                                    )
+                                  }
+                                  disabled={
+                                    customer.status === QueueStatus.Skipped
+                                  }
+                                  className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                                    customer.status === QueueStatus.Skipped
+                                      ? 'bg-rose-600 text-white border-rose-600 font-semibold cursor-default'
+                                      : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50 hover:text-rose-800 hover:border-rose-300 cursor-pointer'
+                                  }`}
+                                >
+                                  Skipped
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    ) : (
+                      <tr>
+                        <td
+                          colSpan={6}
+                          className="py-10 px-4 text-center text-xs text-slate-500"
+                        >
+                          No queue records match the current filter.{' '}
+                          {statusFilter !== 'ALL' || searchQuery ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStatusFilter('ALL');
+                                setSearchQuery('');
+                              }}
+                              className="font-semibold text-slate-900 underline ml-1 cursor-pointer"
+                            >
+                              Reset filters
+                            </button>
                           ) : (
-                            <span className="text-slate-500">Regular</span>
+                            <span>
+                              Customers can join the queue from the Public
+                              Customer Kiosk page.
+                            </span>
                           )}
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-500 font-mono tabular-nums whitespace-nowrap">
-                          <span>In {customer.joinedAt}</span>
-                          {customer.calledAt && (
-                            <>
-                              <span aria-hidden="true"> · </span>
-                              <span>Called {customer.calledAt}</span>
-                            </>
-                          )}
-                          {Boolean(customer.recallCount) && (
-                            <>
-                              <span aria-hidden="true"> · </span>
-                              <span>Recalled {customer.recallCount}x</span>
-                            </>
-                          )}
-                          {customer.completedAt && (
-                            <>
-                              <span aria-hidden="true"> · </span>
-                              <span>Done {customer.completedAt}</span>
-                            </>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          {renderStatusText(customer.status)}
-                        </td>
-                        <td className="py-3 px-4 text-right whitespace-nowrap">
-                          <div className="inline-flex items-center justify-end gap-1">
-                            {/* Priority Lane Toggle Button */}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleToggleCustomerPriority(customer)
-                              }
-                              className={`px-2 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                                customer.isPriority
-                                  ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
-                                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                              }`}
-                              title="Toggle Priority Lane status"
-                            >
-                              {customer.isPriority ? 'Priority ★' : 'Set Priority'}
-                            </button>
-
-                            {/* Mark as Waiting */}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleUpdateCustomerStatus(
-                                  customer,
-                                  QueueStatus.Waiting
-                                )
-                              }
-                              disabled={customer.status === QueueStatus.Waiting}
-                              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                customer.status === QueueStatus.Waiting
-                                  ? 'bg-amber-600 text-white border-amber-600 font-semibold cursor-default'
-                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 cursor-pointer'
-                              }`}
-                            >
-                              Waiting
-                            </button>
-
-                            {/* Mark as Serving (Disabled if already Served or Skipped per Req 7) */}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleUpdateCustomerStatus(
-                                  customer,
-                                  QueueStatus.Serving
-                                )
-                              }
-                              disabled={
-                                customer.status === QueueStatus.Serving ||
-                                isServedOrSkipped
-                              }
-                              title={
-                                isServedOrSkipped
-                                  ? 'Already Served or Skipped customers cannot be called directly as the active customer. Mark as Waiting first to re-queue.'
-                                  : 'Call and mark customer as Serving'
-                              }
-                              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                customer.status === QueueStatus.Serving
-                                  ? 'bg-emerald-600 text-white border-emerald-600 font-semibold cursor-default'
-                                  : isServedOrSkipped
-                                  ? 'bg-slate-50 text-slate-300 border-slate-200 cursor-not-allowed'
-                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-emerald-50 hover:text-emerald-800 hover:border-emerald-300 cursor-pointer'
-                              }`}
-                            >
-                              Serving
-                            </button>
-
-                            {/* Mark as Served */}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleUpdateCustomerStatus(
-                                  customer,
-                                  QueueStatus.Served
-                                )
-                              }
-                              disabled={customer.status === QueueStatus.Served}
-                              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                customer.status === QueueStatus.Served
-                                  ? 'bg-slate-800 text-white border-slate-800 font-semibold cursor-default'
-                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 cursor-pointer'
-                              }`}
-                            >
-                              Served
-                            </button>
-
-                            {/* Mark as Skipped */}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleUpdateCustomerStatus(
-                                  customer,
-                                  QueueStatus.Skipped
-                                )
-                              }
-                              disabled={customer.status === QueueStatus.Skipped}
-                              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                                customer.status === QueueStatus.Skipped
-                                  ? 'bg-rose-600 text-white border-rose-600 font-semibold cursor-default'
-                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50 hover:text-rose-800 hover:border-rose-300 cursor-pointer'
-                              }`}
-                            >
-                              Skipped
-                            </button>
-                          </div>
                         </td>
                       </tr>
-                    );
-                  })
-                ) : (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="py-10 px-4 text-center text-xs text-slate-500"
-                    >
-                      No queue records match the current filter.{' '}
-                      {statusFilter !== 'ALL' || searchQuery ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setStatusFilter('ALL');
-                            setSearchQuery('');
-                          }}
-                          className="font-semibold text-slate-900 underline ml-1 cursor-pointer"
-                        >
-                          Reset filters
-                        </button>
-                      ) : (
-                        <span>
-                          Use the Public Customer Kiosk Check-In form above to
-                          issue the first queue ticket.
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          {/* Recent Activity Log & Access Model Summary */}
-          <div className="pt-2 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            <div className="lg:col-span-7 space-y-2">
-              <h3 className="text-xs font-semibold text-slate-800">
-                Recent Shared Counter Activity
-              </h3>
-              {activityLog.length > 0 ? (
-                <div className="divide-y divide-slate-200 border-t border-b border-slate-200">
-                  {activityLog.slice(0, 4).map((entry) => (
-                    <div
-                      key={entry.id}
-                      className="py-2 flex items-center justify-between gap-4 text-xs"
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="font-mono font-bold text-slate-900 tabular-nums shrink-0">
-                          {entry.queueCode}
-                        </span>
-                        <span className="font-medium text-slate-800 truncate">
-                          {entry.customerName}
-                        </span>
-                        <span aria-hidden="true" className="text-slate-400">
-                          ·
-                        </span>
-                        <span className="text-slate-600 truncate">
-                          {entry.description}
-                        </span>
-                      </div>
-                      <span className="font-mono text-slate-400 tabular-nums shrink-0">
-                        {entry.timestamp}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-xs text-slate-500">
-                  No activity recorded in this session yet.
-                </p>
-              )}
-            </div>
-
-            <div className="lg:col-span-5 text-xs text-slate-600 space-y-1.5 bg-slate-50 p-4 rounded-lg border border-slate-200">
-              <div className="flex items-center gap-1.5 font-semibold text-slate-900">
-                <Users className="w-3.5 h-3.5 text-slate-700" />
-                <span>Priority Queue &amp; Counter Announcement Rules</span>
+                    )}
+                  </tbody>
+                </table>
               </div>
-              <p>
-                1. <strong>Priority Lane Tiering</strong>: Senior Citizen, PWD,
-                Pregnant, and Emergency tickets are automatically ordered ahead
-                of Regular waiting tickets while preserving arrival sequence
-                within each tier.
-              </p>
-              <p>
-                2. <strong>Recall &amp; TV Display</strong>: Staff can recall
-                active tickets to replay voice announcements and flash the
-                shared TV Display monitor before marking a no-show as Skipped.
-              </p>
-            </div>
+
+              {/* Recent Activity Log */}
+              <div className="pt-2 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                <div className="lg:col-span-7 space-y-2">
+                  <h3 className="text-xs font-semibold text-slate-800">
+                    Recent Shared Counter Activity
+                  </h3>
+                  {activityLog.length > 0 ? (
+                    <div className="divide-y divide-slate-200 border-t border-b border-slate-200">
+                      {activityLog.slice(0, 4).map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="py-2 flex items-center justify-between gap-4 text-xs"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="font-mono font-bold text-slate-900 tabular-nums shrink-0">
+                              {entry.queueCode}
+                            </span>
+                            <span className="font-medium text-slate-800 truncate">
+                              {entry.customerName}
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className="text-slate-400"
+                            >
+                              ·
+                            </span>
+                            <span className="text-slate-600 truncate">
+                              {entry.description}
+                            </span>
+                          </div>
+                          <span className="font-mono text-slate-400 tabular-nums shrink-0">
+                            {entry.timestamp}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">
+                      No activity recorded in this session yet.
+                    </p>
+                  )}
+                </div>
+
+                <div className="lg:col-span-5 text-xs text-slate-600 space-y-1.5 bg-slate-50 p-4 rounded-lg border border-slate-200">
+                  <div className="flex items-center gap-1.5 font-semibold text-slate-900">
+                    <Users className="w-3.5 h-3.5 text-slate-700" />
+                    <span>Separated Role Pages</span>
+                  </div>
+                  <p>
+                    • <strong>Customer Kiosk (`#/kiosk`)</strong>: Dedicated
+                    self-check-in page and read-only waiting board for arriving
+                    visitors.
+                  </p>
+                  <p>
+                    • <strong>Staff Console (`#/staff`)</strong>: Authorized
+                    staff dashboard for calling, recalling, and managing queue
+                    statuses.
+                  </p>
+                </div>
+              </div>
+            </section>
           </div>
-        </section>
+        )}
       </main>
 
       {/* Quiet Footer */}
@@ -2609,25 +2756,38 @@ export default function App() {
         <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
           <span>QueueLine — Shared-Facility Digital Queue Management System</span>
           <div className="flex items-center gap-4">
-            <a href="#live-display" className="hover:text-slate-900">
-              Live Display
+            <a
+              href="#/kiosk"
+              onClick={(e) => {
+                e.preventDefault();
+                navigateToPage('kiosk');
+              }}
+              className="hover:text-slate-900"
+            >
+              Public Customer Kiosk
             </a>
             <span aria-hidden="true">·</span>
-            <a href="#join-queue" className="hover:text-slate-900">
-              Customer Check-In
+            <a
+              href="#/staff"
+              onClick={(e) => {
+                e.preventDefault();
+                navigateToPage('staff');
+              }}
+              className="hover:text-slate-900"
+            >
+              Authorized Staff Console
             </a>
             <span aria-hidden="true">·</span>
-            <a href="#staff-console" className="hover:text-slate-900">
-              Staff Console
-            </a>
-            <span aria-hidden="true">·</span>
-            <button
-              type="button"
-              onClick={() => setIsTvDisplayMode(true)}
-              className="hover:text-slate-900 cursor-pointer"
+            <a
+              href="#/tv"
+              onClick={(e) => {
+                e.preventDefault();
+                navigateToPage('tv');
+              }}
+              className="hover:text-slate-900"
             >
               TV Monitor Mode
-            </button>
+            </a>
           </div>
         </div>
       </footer>
