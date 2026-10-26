@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   UserPlus,
   PhoneCall,
@@ -8,7 +8,6 @@ import {
   UserCheck,
   Search,
   Lock,
-  Unlock,
   RotateCcw,
   Volume2,
   VolumeX,
@@ -16,7 +15,38 @@ import {
   AlertCircle,
   ArrowRight,
   ShieldCheck,
+  Cloud,
+  LogIn,
+  LogOut,
+  Users,
 } from 'lucide-react';
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  User,
+} from 'firebase/auth';
+import {
+  collection,
+  doc,
+  getDoc,
+  setDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  where,
+  serverTimestamp,
+  writeBatch,
+  runTransaction,
+  deleteField,
+} from 'firebase/firestore';
+import {
+  auth,
+  db,
+  googleProvider,
+  OperationType,
+  handleFirestoreError,
+} from './firebase';
 import {
   QueueStatus,
   QueueCustomer,
@@ -29,25 +59,37 @@ import {
   SERVICE_PURPOSES,
 } from './data/initialQueue';
 
-const STORAGE_KEY_CUSTOMERS = 'queueline_customers_v1';
-const STORAGE_KEY_NEXT_SEQ = 'queueline_next_seq_v1';
-const STORAGE_KEY_ACTIVITY = 'queueline_activity_v1';
-const DEFAULT_STAFF_PIN = '1234';
+const SHARED_FACILITY_ID = 'main-counter';
+const BOOTSTRAPPED_ADMIN_EMAIL = 'tumando.marvinken@dnsc.edu.ph';
+
+// Blueprint validation constants (synced with firebase-blueprint.json & firestore.rules)
+const MAX_NAME_LENGTH = 80;
+const MAX_PURPOSE_LENGTH = 80;
+const MAX_DESCRIPTION_LENGTH = 200;
+const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
+const VALID_QUEUE_CODE_REGEX = /^Q-[0-9]{3,6}$/;
 
 function formatCurrentTime(): string {
   const now = new Date();
   return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function sanitizeId(rawId: string): string {
+  const cleaned = rawId.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 128);
+  return VALID_ID_REGEX.test(cleaned) ? cleaned : `id-${Date.now()}`;
+}
+
 function playCallChime(enabled: boolean) {
   if (!enabled || typeof window === 'undefined') return;
   try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
     if (!AudioCtx) return;
     const ctx = new AudioCtx();
     const now = ctx.currentTime;
 
-    // Two-tone pleasant service counter chime (E5 -> C5)
     const freqs = [659.25, 523.25];
     freqs.forEach((freq, idx) => {
       const osc = ctx.createOscillator();
@@ -71,57 +113,31 @@ function playCallChime(enabled: boolean) {
 }
 
 export default function App() {
-  // Queue state with localStorage persistence
-  const [customers, setCustomers] = useState<QueueCustomer[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_CUSTOMERS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {
-      // Fallback to initial
-    }
-    return INITIAL_CUSTOMERS;
-  });
+  // Firebase Auth & Staff Role State
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isStaffVerified, setIsStaffVerified] = useState<boolean>(false);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const [isJoiningQueue, setIsJoiningQueue] = useState<boolean>(false);
+  const hasSeededSharedQueueRef = useRef<boolean>(false);
 
-  const [nextSequence, setNextSequence] = useState<number>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_NEXT_SEQ);
-      if (saved) {
-        const num = parseInt(saved, 10);
-        if (!Number.isNaN(num) && num >= 101) return num;
-      }
-    } catch {
-      // Fallback
-    }
-    return 108;
-  });
+  // Shared Facility Queue State (Live synced from Cloud Firestore for both Public Kiosk & Staff)
+  const [customers, setCustomers] = useState<QueueCustomer[]>(INITIAL_CUSTOMERS);
+  const [nextSequence, setNextSequence] = useState<number>(108);
+  const [activityLog, setActivityLog] = useState<QueueActivityEntry[]>(
+    INITIAL_ACTIVITY_LOG
+  );
+  const [isCloudConnected, setIsCloudConnected] = useState<boolean>(false);
 
-  const [activityLog, setActivityLog] = useState<QueueActivityEntry[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_ACTIVITY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {
-      // Fallback
-    }
-    return INITIAL_ACTIVITY_LOG;
-  });
-
-  // Customer Check-In Form State
+  // Customer Check-In Form State (Public Kiosk — No Login Required)
   const [customerName, setCustomerName] = useState('');
   const [customerPurpose, setCustomerPurpose] = useState(SERVICE_PURPOSES[0]);
   const [formError, setFormError] = useState<string | null>(null);
-  const [lastIssuedTicket, setLastIssuedTicket] = useState<IssuedTicketReceipt | null>(null);
+  const [lastIssuedTicket, setLastIssuedTicket] =
+    useState<IssuedTicketReceipt | null>(null);
 
-  // Staff Authorization & Controls State
-  const [isStaffAuthorized, setIsStaffAuthorized] = useState<boolean>(true);
-  const [showPinPrompt, setShowPinPrompt] = useState<boolean>(false);
-  const [pinInput, setPinInput] = useState<string>('');
-  const [pinError, setPinError] = useState<string | null>(null);
+  // Staff Controls & UI Feedback State
+  const [showStaffAuthBanner, setShowStaffAuthBanner] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [staffBannerMessage, setStaffBannerMessage] = useState<{
     type: 'info' | 'warning' | 'success';
@@ -132,42 +148,258 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState<'ALL' | QueueStatus>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  // Sync to localStorage
+  // 1. Track Firebase Authentication & Verify / Register Staff Admin Record (/admins/{uid})
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(customers));
-      localStorage.setItem(STORAGE_KEY_NEXT_SEQ, String(nextSequence));
-      localStorage.setItem(STORAGE_KEY_ACTIVITY, JSON.stringify(activityLog));
-    } catch {
-      // Ignore storage quota issues
-    }
-  }, [customers, nextSequence, activityLog]);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      if (!user) {
+        setIsStaffVerified(false);
+        setIsAuthReady(true);
+        return;
+      }
 
-  // Cross-tab synchronization
-  useEffect(() => {
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key === STORAGE_KEY_CUSTOMERS && e.newValue) {
-        try {
-          setCustomers(JSON.parse(e.newValue));
-        } catch {
-          // Ignore
+      try {
+        if (
+          user.emailVerified &&
+          user.email === BOOTSTRAPPED_ADMIN_EMAIL
+        ) {
+          setIsStaffVerified(true);
+          setShowStaffAuthBanner(false);
+        } else if (user.emailVerified) {
+          const adminRef = doc(db, 'admins', user.uid);
+          const adminSnap = await getDoc(adminRef);
+          if (!adminSnap.exists()) {
+            await setDoc(adminRef, {
+              uid: user.uid,
+              createdAt: serverTimestamp(),
+            });
+          }
+          setIsStaffVerified(true);
+          setShowStaffAuthBanner(false);
+        } else {
+          setIsStaffVerified(false);
         }
+      } catch (error) {
+        console.error('Error verifying staff role:', error);
+        setIsStaffVerified(Boolean(user.emailVerified));
+      } finally {
+        setIsAuthReady(true);
       }
-      if (e.key === STORAGE_KEY_NEXT_SEQ && e.newValue) {
-        const parsed = parseInt(e.newValue, 10);
-        if (!Number.isNaN(parsed)) setNextSequence(parsed);
-      }
-      if (e.key === STORAGE_KEY_ACTIVITY && e.newValue) {
-        try {
-          setActivityLog(JSON.parse(e.newValue));
-        } catch {
-          // Ignore
-        }
-      }
-    };
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
+    });
+    return () => unsubscribe();
   }, []);
+
+  // 2. Attach Real-Time Shared Facility Listeners (Works for BOTH Unauthenticated Kiosk & Authenticated Staff)
+  useEffect(() => {
+    const counterRef = doc(db, 'queue_counters', SHARED_FACILITY_ID);
+    const customersQuery = query(
+      collection(db, 'queue_customers'),
+      where('facilityId', '==', SHARED_FACILITY_ID)
+    );
+    const activitiesQuery = query(
+      collection(db, 'queue_activities'),
+      where('facilityId', '==', SHARED_FACILITY_ID)
+    );
+
+    const unsubCounter = onSnapshot(
+      counterRef,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          const lastSeq = Number(data.lastSequenceNumber);
+          if (!Number.isNaN(lastSeq) && lastSeq >= 100) {
+            setNextSequence(lastSeq + 1);
+          }
+        }
+      },
+      (error) => {
+        handleFirestoreError(
+          error,
+          OperationType.GET,
+          `queue_counters/${SHARED_FACILITY_ID}`
+        );
+      }
+    );
+
+    const unsubCustomers = onSnapshot(
+      customersQuery,
+      async (snapshot) => {
+        setIsCloudConnected(true);
+
+        // Seed initial shared queue if empty on first facility startup
+        if (
+          snapshot.empty &&
+          !hasSeededSharedQueueRef.current &&
+          localStorage.getItem('queueline_shared_cleared') !== 'true'
+        ) {
+          hasSeededSharedQueueRef.current = true;
+          try {
+            const batch = writeBatch(db);
+            // If staff is signed in, we can seed all statuses; if public kiosk boots first, seed the Waiting tickets
+            const ticketsToSeed = isStaffVerified
+              ? INITIAL_CUSTOMERS
+              : INITIAL_CUSTOMERS.filter(
+                  (c) => c.status === QueueStatus.Waiting
+                );
+
+            ticketsToSeed.forEach((cust) => {
+              const docId = sanitizeId(`shared_${cust.id}`);
+              const ref = doc(db, 'queue_customers', docId);
+              const payload: Record<string, unknown> = {
+                id: docId,
+                facilityId: SHARED_FACILITY_ID,
+                sequenceNumber: cust.sequenceNumber,
+                queueCode: cust.queueCode,
+                name: cust.name.slice(0, MAX_NAME_LENGTH),
+                purpose: cust.purpose.slice(0, MAX_PURPOSE_LENGTH),
+                status: cust.status,
+                joinedAt: cust.joinedAt.slice(0, 32),
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              };
+              if (isStaffVerified && cust.calledAt) {
+                payload.calledAt = cust.calledAt.slice(0, 32);
+              }
+              if (isStaffVerified && cust.completedAt) {
+                payload.completedAt = cust.completedAt.slice(0, 32);
+              }
+              batch.set(ref, payload);
+            });
+
+            batch.set(doc(db, 'queue_counters', SHARED_FACILITY_ID), {
+              id: SHARED_FACILITY_ID,
+              facilityId: SHARED_FACILITY_ID,
+              lastSequenceNumber: 107,
+              updatedAt: serverTimestamp(),
+            });
+
+            INITIAL_ACTIVITY_LOG.forEach((act) => {
+              const actDocId = sanitizeId(`shared_${act.id}`);
+              batch.set(doc(db, 'queue_activities', actDocId), {
+                id: actDocId,
+                facilityId: SHARED_FACILITY_ID,
+                timestamp: act.timestamp.slice(0, 32),
+                queueCode: act.queueCode,
+                customerName: act.customerName.slice(0, MAX_NAME_LENGTH),
+                description: act.description.slice(0, MAX_DESCRIPTION_LENGTH),
+                createdAt: serverTimestamp(),
+              });
+            });
+
+            await batch.commit();
+          } catch (error) {
+            handleFirestoreError(error, OperationType.WRITE, 'queue_customers');
+          }
+          return;
+        }
+
+        const loaded: QueueCustomer[] = snapshot.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: data.id,
+            sequenceNumber: Number(data.sequenceNumber),
+            queueCode: data.queueCode,
+            name: data.name,
+            purpose: data.purpose,
+            status: data.status as QueueStatus,
+            joinedAt: data.joinedAt,
+            calledAt: data.calledAt,
+            completedAt: data.completedAt,
+          };
+        });
+
+        setCustomers(loaded);
+        if (loaded.length > 0) {
+          const maxSeq = Math.max(...loaded.map((c) => c.sequenceNumber));
+          setNextSequence((prev) => Math.max(prev, maxSeq + 1));
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'queue_customers');
+      }
+    );
+
+    const unsubActivities = onSnapshot(
+      activitiesQuery,
+      (snapshot) => {
+        const loadedActs: QueueActivityEntry[] = snapshot.docs
+          .map((d) => {
+            const data = d.data();
+            const createdMillis =
+              data.createdAt && typeof data.createdAt.toMillis === 'function'
+                ? data.createdAt.toMillis()
+                : 0;
+            return {
+              id: data.id,
+              timestamp: data.timestamp,
+              queueCode: data.queueCode,
+              customerName: data.customerName,
+              description: data.description,
+              _sortTime: createdMillis,
+            };
+          })
+          .sort((a, b) => b._sortTime - a._sortTime)
+          .map(({ _sortTime, ...rest }) => rest);
+
+        setActivityLog(loadedActs);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'queue_activities');
+      }
+    );
+
+    return () => {
+      unsubCounter();
+      unsubCustomers();
+      unsubActivities();
+    };
+  }, [isStaffVerified]);
+
+  const handleGoogleStaffSignIn = async () => {
+    setIsSigningIn(true);
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      if (result.user.emailVerified) {
+        const adminRef = doc(db, 'admins', result.user.uid);
+        const adminSnap = await getDoc(adminRef);
+        if (!adminSnap.exists()) {
+          await setDoc(adminRef, {
+            uid: result.user.uid,
+            createdAt: serverTimestamp(),
+          });
+        }
+      }
+      setIsStaffVerified(true);
+      setShowStaffAuthBanner(false);
+      setStaffBannerMessage({
+        type: 'success',
+        text: `Authorized Staff signed in (${result.user.email}). You can now call customers and update ticket statuses on the shared queue.`,
+      });
+    } catch (error) {
+      setStaffBannerMessage({
+        type: 'warning',
+        text:
+          error instanceof Error
+            ? `Staff Google Sign-In failed: ${error.message}`
+            : 'Staff Google Sign-In was cancelled or failed.',
+      });
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  const handleStaffSignOut = async () => {
+    try {
+      await signOut(auth);
+      setIsStaffVerified(false);
+      setStaffBannerMessage({
+        type: 'info',
+        text: 'Signed out of Staff Console. Terminal is now in Public Kiosk / Display mode.',
+      });
+    } catch (error) {
+      console.error('Sign out error:', error);
+    }
+  };
 
   // Derived Queue Segments (strictly ordered by sequenceNumber)
   const sortedCustomers = useMemo(() => {
@@ -189,10 +421,14 @@ export default function App() {
   const counts = useMemo(() => {
     return {
       total: sortedCustomers.length,
-      waiting: sortedCustomers.filter((c) => c.status === QueueStatus.Waiting).length,
-      serving: sortedCustomers.filter((c) => c.status === QueueStatus.Serving).length,
-      served: sortedCustomers.filter((c) => c.status === QueueStatus.Served).length,
-      skipped: sortedCustomers.filter((c) => c.status === QueueStatus.Skipped).length,
+      waiting: sortedCustomers.filter((c) => c.status === QueueStatus.Waiting)
+        .length,
+      serving: sortedCustomers.filter((c) => c.status === QueueStatus.Serving)
+        .length,
+      served: sortedCustomers.filter((c) => c.status === QueueStatus.Served)
+        .length,
+      skipped: sortedCustomers.filter((c) => c.status === QueueStatus.Skipped)
+        .length,
     };
   }, [sortedCustomers]);
 
@@ -210,23 +446,44 @@ export default function App() {
     });
   }, [sortedCustomers, statusFilter, searchQuery]);
 
-  const logActivity = (queueCode: string, name: string, description: string) => {
-    const newEntry: QueueActivityEntry = {
-      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      timestamp: formatCurrentTime(),
-      queueCode,
-      customerName: name,
-      description,
-    };
-    setActivityLog((prev) => [newEntry, ...prev.slice(0, 24)]);
+  const logSharedActivity = async (
+    queueCode: string,
+    name: string,
+    description: string
+  ) => {
+    const docId = sanitizeId(
+      `shared_act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+    );
+    const timeStr = formatCurrentTime();
+    const safeName = name.trim().slice(0, MAX_NAME_LENGTH);
+    const safeDesc = description.trim().slice(0, MAX_DESCRIPTION_LENGTH);
+
+    try {
+      await setDoc(doc(db, 'queue_activities', docId), {
+        id: docId,
+        facilityId: SHARED_FACILITY_ID,
+        timestamp: timeStr.slice(0, 32),
+        queueCode,
+        customerName: safeName,
+        description: safeDesc,
+        createdAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.CREATE,
+        `queue_activities/${docId}`
+      );
+    }
   };
 
-  // Requirement 1 & 2: Customer enters name and joins queue with unique auto-assigned queue number
-  const handleJoinQueue = (e: React.FormEvent) => {
+  // Requirement 1 & 2: Public Kiosk Customer Check-In (No Staff Login Required!)
+  // Uses a Firestore Transaction on /queue_counters/main-counter for atomic sequential numbering
+  const handleJoinQueue = async (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmedName = customerName.trim();
+    const trimmedName = customerName.trim().slice(0, MAX_NAME_LENGTH);
     if (!trimmedName) {
-      setFormError('Please enter the customer name to assign a queue number.');
+      setFormError('Please enter your name to receive a queue number.');
       return;
     }
     if (trimmedName.length < 2) {
@@ -234,56 +491,102 @@ export default function App() {
       return;
     }
 
-    const assignedSeq = nextSequence;
-    const assignedCode = `Q-${String(assignedSeq).padStart(3, '0')}`;
-    const timeStr = formatCurrentTime();
-    const waitingAheadCount = waitingCustomers.length;
-
-    const newCustomer: QueueCustomer = {
-      id: `cust-${assignedSeq}-${Date.now()}`,
-      sequenceNumber: assignedSeq,
-      queueCode: assignedCode,
-      name: trimmedName,
-      purpose: customerPurpose,
-      status: QueueStatus.Waiting,
-      joinedAt: timeStr,
-    };
-
-    setCustomers((prev) => [...prev, newCustomer]);
-    setNextSequence((prev) => prev + 1);
-    setCustomerName('');
+    setIsJoiningQueue(true);
     setFormError(null);
 
-    setLastIssuedTicket({
-      queueCode: assignedCode,
-      name: trimmedName,
-      purpose: customerPurpose,
-      joinedAt: timeStr,
-      waitingAhead: waitingAheadCount,
-    });
+    const timeStr = formatCurrentTime();
+    const waitingAheadCount = waitingCustomers.length;
+    const safePurpose = customerPurpose.slice(0, MAX_PURPOSE_LENGTH);
 
-    logActivity(assignedCode, trimmedName, `Joined waiting queue (${customerPurpose})`);
+    try {
+      localStorage.removeItem('queueline_shared_cleared');
+      const counterRef = doc(db, 'queue_counters', SHARED_FACILITY_ID);
+
+      const issuedResult = await runTransaction(db, async (transaction) => {
+        const counterSnap = await transaction.get(counterRef);
+        let assignedSeq = 101;
+
+        if (!counterSnap.exists()) {
+          const highestExisting =
+            sortedCustomers.length > 0
+              ? Math.max(...sortedCustomers.map((c) => c.sequenceNumber))
+              : 100;
+          assignedSeq = Math.max(101, highestExisting + 1);
+          transaction.set(counterRef, {
+            id: SHARED_FACILITY_ID,
+            facilityId: SHARED_FACILITY_ID,
+            lastSequenceNumber: assignedSeq,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          const currentLast = Number(counterSnap.data().lastSequenceNumber) || 100;
+          assignedSeq = currentLast + 1;
+          transaction.update(counterRef, {
+            lastSequenceNumber: assignedSeq,
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        const assignedCode = `Q-${String(assignedSeq).padStart(3, '0')}`;
+        if (!VALID_QUEUE_CODE_REGEX.test(assignedCode)) {
+          throw new Error('Generated queue code failed format check.');
+        }
+
+        const docId = sanitizeId(`shared_cust_${assignedSeq}_${Date.now()}`);
+        const customerRef = doc(db, 'queue_customers', docId);
+
+        transaction.set(customerRef, {
+          id: docId,
+          facilityId: SHARED_FACILITY_ID,
+          sequenceNumber: assignedSeq,
+          queueCode: assignedCode,
+          name: trimmedName,
+          purpose: safePurpose,
+          status: QueueStatus.Waiting,
+          joinedAt: timeStr.slice(0, 32),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        return { assignedCode, assignedSeq };
+      });
+
+      setCustomerName('');
+      setLastIssuedTicket({
+        queueCode: issuedResult.assignedCode,
+        name: trimmedName,
+        purpose: safePurpose,
+        joinedAt: timeStr,
+        waitingAhead: waitingAheadCount,
+      });
+
+      await logSharedActivity(
+        issuedResult.assignedCode,
+        trimmedName,
+        `Joined waiting queue via Kiosk (${safePurpose})`
+      );
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'queue_customers');
+    } finally {
+      setIsJoiningQueue(false);
+    }
   };
 
-  // Requirement 4, 6, 7: Allow authorized staff to call the next waiting customer
-  // Prevents Served or Skipped customers from being called as the next active customer
-  const handleCallNextCustomer = () => {
-    if (!isStaffAuthorized) {
-      setShowPinPrompt(true);
+  // Requirement 4, 6, 7: Allow Authorized Staff (Google Sign-In + /admins verified) to call the next waiting customer
+  const handleCallNextCustomer = async () => {
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
       setStaffBannerMessage({
         type: 'warning',
-        text: 'Staff authorization is locked. Unlock staff controls (PIN: 1234) to call the next customer.',
+        text: 'Staff Google Sign-In is required to call customers or modify the shared queue.',
       });
       return;
     }
 
     const timeStr = formatCurrentTime();
-
-    // Strictly select only from customers currently in 'Waiting' status (Req 7)
     const nextCandidate = waitingCustomers[0];
 
     if (!nextCandidate) {
-      // If someone is currently being served and no one is waiting, let staff know
       if (currentlyServing) {
         setStaffBannerMessage({
           type: 'info',
@@ -300,38 +603,39 @@ export default function App() {
 
     const previousServing = currentlyServing;
 
-    setCustomers((prev) =>
-      prev.map((cust) => {
-        // Complete any currently active Serving customer automatically when calling next
-        if (cust.status === QueueStatus.Serving) {
-          return {
-            ...cust,
-            status: QueueStatus.Served,
-            completedAt: timeStr,
-          };
-        }
-        // Transition the earliest Waiting customer to Serving
-        if (cust.id === nextCandidate.id) {
-          return {
-            ...cust,
-            status: QueueStatus.Serving,
-            calledAt: timeStr,
-          };
-        }
-        return cust;
-      })
-    );
+    try {
+      const batch = writeBatch(db);
+      if (previousServing) {
+        batch.update(doc(db, 'queue_customers', previousServing.id), {
+          status: QueueStatus.Served,
+          completedAt: timeStr.slice(0, 32),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      batch.update(doc(db, 'queue_customers', nextCandidate.id), {
+        status: QueueStatus.Serving,
+        calledAt: timeStr.slice(0, 32),
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.UPDATE,
+        `queue_customers/${nextCandidate.id}`
+      );
+    }
 
     playCallChime(soundEnabled);
 
     if (previousServing) {
-      logActivity(
+      await logSharedActivity(
         previousServing.queueCode,
         previousServing.name,
         'Completed service · Marked as Served'
       );
     }
-    logActivity(
+    await logSharedActivity(
       nextCandidate.queueCode,
       nextCandidate.name,
       'Called as next active customer · Status set to Serving'
@@ -345,17 +649,16 @@ export default function App() {
     });
   };
 
-  // Requirement 5 & 7: Allow staff to mark customers as Waiting, Serving, Served, Skipped
-  // While preventing already Served or Skipped customers from being directly called as Serving
-  const handleUpdateCustomerStatus = (
+  // Requirement 5 & 7: Allow Authorized Staff to mark customers as Waiting, Serving, Served, Skipped
+  const handleUpdateCustomerStatus = async (
     targetCustomer: QueueCustomer,
     newStatus: QueueStatus
   ) => {
-    if (!isStaffAuthorized) {
-      setShowPinPrompt(true);
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
       setStaffBannerMessage({
         type: 'warning',
-        text: 'Unlock Staff Authorization (PIN: 1234) to update customer queue statuses.',
+        text: 'Sign in with a Staff Google Account to change customer queue statuses.',
       });
       return;
     }
@@ -377,44 +680,58 @@ export default function App() {
 
     const timeStr = formatCurrentTime();
 
-    setCustomers((prev) =>
-      prev.map((cust) => {
-        // Ensure only one customer is 'Serving' at a time on a single service counter
-        if (
-          newStatus === QueueStatus.Serving &&
-          cust.status === QueueStatus.Serving &&
-          cust.id !== targetCustomer.id
-        ) {
-          return {
-            ...cust,
-            status: QueueStatus.Served,
-            completedAt: timeStr,
-          };
-        }
+    try {
+      const batch = writeBatch(db);
+      if (
+        newStatus === QueueStatus.Serving &&
+        currentlyServing &&
+        currentlyServing.id !== targetCustomer.id
+      ) {
+        batch.update(doc(db, 'queue_customers', currentlyServing.id), {
+          status: QueueStatus.Served,
+          completedAt: timeStr.slice(0, 32),
+          updatedAt: serverTimestamp(),
+        });
+      }
 
-        if (cust.id === targetCustomer.id) {
-          return {
-            ...cust,
-            status: newStatus,
-            calledAt:
-              newStatus === QueueStatus.Serving ? timeStr : cust.calledAt,
-            completedAt:
-              newStatus === QueueStatus.Served ||
-              newStatus === QueueStatus.Skipped
-                ? timeStr
-                : undefined,
-          };
-        }
+      const targetRef = doc(db, 'queue_customers', targetCustomer.id);
+      if (newStatus === QueueStatus.Serving) {
+        batch.update(targetRef, {
+          status: QueueStatus.Serving,
+          calledAt: timeStr.slice(0, 32),
+          updatedAt: serverTimestamp(),
+        });
+      } else if (
+        newStatus === QueueStatus.Served ||
+        newStatus === QueueStatus.Skipped
+      ) {
+        batch.update(targetRef, {
+          status: newStatus,
+          completedAt: timeStr.slice(0, 32),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        batch.update(targetRef, {
+          status: QueueStatus.Waiting,
+          completedAt: deleteField(),
+          updatedAt: serverTimestamp(),
+        });
+      }
 
-        return cust;
-      })
-    );
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.UPDATE,
+        `queue_customers/${targetCustomer.id}`
+      );
+    }
 
     if (newStatus === QueueStatus.Serving) {
       playCallChime(soundEnabled);
     }
 
-    logActivity(
+    await logSharedActivity(
       targetCustomer.queueCode,
       targetCustomer.name,
       `Status changed from ${targetCustomer.status} to ${newStatus}`
@@ -426,51 +743,99 @@ export default function App() {
     });
   };
 
-  // Staff PIN authentication handler
-  const handleUnlockStaff = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (pinInput.trim() === DEFAULT_STAFF_PIN) {
-      setIsStaffAuthorized(true);
-      setShowPinPrompt(false);
-      setPinInput('');
-      setPinError(null);
-      setStaffBannerMessage({
-        type: 'success',
-        text: 'Staff console authorized. Queue management controls are active.',
+  const handleResetDemoData = async () => {
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
+      return;
+    }
+
+    localStorage.removeItem('queueline_shared_cleared');
+    try {
+      const batch = writeBatch(db);
+      customers.forEach((c) => {
+        batch.delete(doc(db, 'queue_customers', c.id));
       });
-    } else {
-      setPinError('Incorrect staff PIN. Use default PIN 1234.');
+      activityLog.forEach((a) => {
+        batch.delete(doc(db, 'queue_activities', a.id));
+      });
+
+      INITIAL_CUSTOMERS.forEach((cust) => {
+        const docId = sanitizeId(`shared_${cust.id}`);
+        const payload: Record<string, unknown> = {
+          id: docId,
+          facilityId: SHARED_FACILITY_ID,
+          sequenceNumber: cust.sequenceNumber,
+          queueCode: cust.queueCode,
+          name: cust.name.slice(0, MAX_NAME_LENGTH),
+          purpose: cust.purpose.slice(0, MAX_PURPOSE_LENGTH),
+          status: cust.status,
+          joinedAt: cust.joinedAt.slice(0, 32),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        };
+        if (cust.calledAt) payload.calledAt = cust.calledAt.slice(0, 32);
+        if (cust.completedAt)
+          payload.completedAt = cust.completedAt.slice(0, 32);
+        batch.set(doc(db, 'queue_customers', docId), payload);
+      });
+
+      batch.set(doc(db, 'queue_counters', SHARED_FACILITY_ID), {
+        id: SHARED_FACILITY_ID,
+        facilityId: SHARED_FACILITY_ID,
+        lastSequenceNumber: 107,
+        updatedAt: serverTimestamp(),
+      });
+
+      INITIAL_ACTIVITY_LOG.forEach((act) => {
+        const actDocId = sanitizeId(`shared_${act.id}`);
+        batch.set(doc(db, 'queue_activities', actDocId), {
+          id: actDocId,
+          facilityId: SHARED_FACILITY_ID,
+          timestamp: act.timestamp.slice(0, 32),
+          queueCode: act.queueCode,
+          customerName: act.customerName.slice(0, MAX_NAME_LENGTH),
+          description: act.description.slice(0, MAX_DESCRIPTION_LENGTH),
+          createdAt: serverTimestamp(),
+        });
+      });
+
+      await batch.commit();
+      setLastIssuedTicket(null);
+      setStaffBannerMessage({
+        type: 'info',
+        text: 'Shared facility queue restored to initial sample state (Q-101 through Q-107).',
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'queue_customers');
     }
   };
 
-  const handleResetDemoData = () => {
-    if (!isStaffAuthorized) {
-      setShowPinPrompt(true);
+  const handleClearAllQueue = async () => {
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
       return;
     }
-    setCustomers(INITIAL_CUSTOMERS);
-    setNextSequence(108);
-    setActivityLog(INITIAL_ACTIVITY_LOG);
-    setLastIssuedTicket(null);
-    setStaffBannerMessage({
-      type: 'info',
-      text: 'Queue restored to initial sample state (Q-101 through Q-107).',
-    });
-  };
 
-  const handleClearAllQueue = () => {
-    if (!isStaffAuthorized) {
-      setShowPinPrompt(true);
-      return;
+    localStorage.setItem('queueline_shared_cleared', 'true');
+    try {
+      await Promise.all([
+        ...customers.map((c) => deleteDoc(doc(db, 'queue_customers', c.id))),
+        ...activityLog.map((a) => deleteDoc(doc(db, 'queue_activities', a.id))),
+        setDoc(doc(db, 'queue_counters', SHARED_FACILITY_ID), {
+          id: SHARED_FACILITY_ID,
+          facilityId: SHARED_FACILITY_ID,
+          lastSequenceNumber: 100,
+          updatedAt: serverTimestamp(),
+        }),
+      ]);
+      setLastIssuedTicket(null);
+      setStaffBannerMessage({
+        type: 'info',
+        text: 'Shared facility queue cleared. Next customer check-in will be assigned Q-101.',
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, 'queue_customers');
     }
-    setCustomers([]);
-    setNextSequence(101);
-    setActivityLog([]);
-    setLastIssuedTicket(null);
-    setStaffBannerMessage({
-      type: 'info',
-      text: 'All queue entries cleared. Next customer will be assigned Q-101.',
-    });
   };
 
   // Semantic status presentation (unboxed text + icon, never hue-only, zero pill containers)
@@ -508,7 +873,10 @@ export default function App() {
   };
 
   return (
-    <div id="top" className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
+    <div
+      id="top"
+      className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]"
+    >
       {/* Strictly 3-Zone Top Navigation Bar */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 lg:px-10 py-3.5 bg-white/95 backdrop-blur border-b border-slate-200">
         {/* Zone 1: Brand Title (one line, single text element) */}
@@ -567,15 +935,22 @@ export default function App() {
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
             <div>
               <p className="text-xs font-medium text-slate-500">
-                Single Service Counter · Sequential Digital Queue
+                Shared Facility Cloud Queue ({SHARED_FACILITY_ID}) ·{' '}
+                {isCloudConnected
+                  ? 'Live Multi-Device Sync Active'
+                  : 'Connecting to Cloud Firestore...'}{' '}
+                ·{' '}
+                {currentUser && isStaffVerified
+                  ? `Authorized Staff (${currentUser.email})`
+                  : 'Public Kiosk & Display Mode (No Sign-In Needed to Join)'}
               </p>
               <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-0.5">
-                Live Counter Status &amp; Queue Monitor
+                Live Counter Status &amp; Shared Queue Monitor
               </h1>
             </div>
 
-            {/* Audio Chime & Staff Lock Status Controls */}
-            <div className="flex items-center gap-2 self-start sm:self-auto">
+            {/* Staff Google Auth & Audio Chime Controls */}
+            <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
               <button
                 type="button"
                 onClick={() => setSoundEnabled((prev) => !prev)}
@@ -595,96 +970,70 @@ export default function App() {
                 )}
               </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  if (isStaffAuthorized) {
-                    setIsStaffAuthorized(false);
-                    setStaffBannerMessage({
-                      type: 'info',
-                      text: 'Staff Console locked. Public kiosk mode active.',
-                    });
-                  } else {
-                    setShowPinPrompt(true);
-                  }
-                }}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  isStaffAuthorized
-                    ? 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
-                    : 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
-                }`}
-              >
-                {isStaffAuthorized ? (
-                  <>
-                    <Unlock className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>Staff Authorized</span>
-                  </>
-                ) : (
-                  <>
-                    <Lock className="w-3.5 h-3.5 text-amber-600" />
-                    <span>Staff Locked (Unlock)</span>
-                  </>
-                )}
-              </button>
+              {isAuthReady && currentUser && isStaffVerified ? (
+                <button
+                  type="button"
+                  onClick={handleStaffSignOut}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Signed in as Authorized Staff via Google"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Staff Authorized ({currentUser.email})</span>
+                  <LogOut className="w-3 h-3 ml-1 text-emerald-700" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleGoogleStaffSignIn}
+                  disabled={isSigningIn}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-50 border border-amber-300 rounded-lg hover:bg-amber-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <LogIn className="w-3.5 h-3.5 text-amber-700" />
+                  <span>
+                    {isSigningIn
+                      ? 'Verifying Staff...'
+                      : 'Staff Sign In with Google'}
+                  </span>
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Staff PIN Modal / Inline Unlock Bar when locked */}
-          {showPinPrompt && !isStaffAuthorized && (
-            <form
-              onSubmit={handleUnlockStaff}
-              className="p-4 bg-white border border-slate-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-            >
+          {/* Staff Google Authentication Banner when unauthenticated user clicks a Staff control */}
+          {showStaffAuthBanner && (!currentUser || !isStaffVerified) && (
+            <div className="p-4 bg-white border border-amber-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div className="space-y-0.5">
                 <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-                  <ShieldCheck className="w-4 h-4 text-slate-700" />
-                  <span>Staff Authorization Required</span>
+                  <Lock className="w-4 h-4 text-amber-600" />
+                  <span>Authorized Staff Sign-In Required</span>
                 </div>
                 <p className="text-xs text-slate-600">
-                  Enter the staff PIN to unlock calling and status changes (Default PIN: <span className="font-mono font-semibold">1234</span>).
+                  Customers can view and join the shared queue freely without signing in. Calling the next customer or changing ticket statuses requires an authorized Staff Google account.
                 </p>
-                {pinError && (
-                  <p className="text-xs font-medium text-rose-600 pt-1">{pinError}</p>
-                )}
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                <input
-                  type="password"
-                  value={pinInput}
-                  onChange={(e) => setPinInput(e.target.value)}
-                  placeholder="PIN (1234)"
-                  aria-label="Staff PIN"
-                  className="w-32 px-3 py-1.5 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900"
-                />
                 <button
-                  type="submit"
-                  className="px-3.5 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
+                  type="button"
+                  onClick={handleGoogleStaffSignIn}
+                  disabled={isSigningIn}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Verify PIN
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>
+                    {isSigningIn
+                      ? 'Signing In...'
+                      : 'Sign in with Google (Staff)'}
+                  </span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsStaffAuthorized(true);
-                    setShowPinPrompt(false);
-                    setPinError(null);
-                  }}
-                  className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Quick Authorize
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowPinPrompt(false);
-                    setPinError(null);
-                  }}
+                  onClick={() => setShowStaffAuthBanner(false)}
                   className="px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Cancel
+                  Dismiss
                 </button>
               </div>
-            </form>
+            </div>
           )}
 
           {/* Dominant Visual Focal Anchor: Now Serving Board + Next Up */}
@@ -783,8 +1132,8 @@ export default function App() {
                     </p>
                     <p className="text-xs text-slate-400 mt-1">
                       {waitingCustomers.length > 0
-                        ? `${waitingCustomers.length} customer(s) waiting in line. Click "Call Next Customer" to serve ${waitingCustomers[0].queueCode}.`
-                        : 'The waiting line is currently empty. New customers can join below.'}
+                        ? `${waitingCustomers.length} customer(s) waiting in line. Authorized staff can click "Call Next Customer" to serve ${waitingCustomers[0].queueCode}.`
+                        : 'The waiting line is currently empty. New customers can check in below without signing in.'}
                     </p>
                   </div>
                 )}
@@ -838,7 +1187,7 @@ export default function App() {
                       {counts.waiting}
                     </div>
                     <p className="text-xs text-slate-500 mt-1">
-                      In sequential line order
+                      In shared sequential line
                     </p>
                   </div>
                 </div>
@@ -897,9 +1246,9 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 2: Two-Column Split — Customer Join Queue (Left) & Currently Waiting List (Right) */}
+        {/* Section 2: Two-Column Split — Public Customer Kiosk (Left) & Shared Waiting List (Right) */}
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          {/* Left 5 Columns: Customer Check-In / Join Queue Form (Req 1 & Req 2) */}
+          {/* Left 5 Columns: Public Customer Kiosk Check-In Form (No Sign-In Needed) */}
           <div
             id="join-queue"
             className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 sm:p-7 flex flex-col justify-between"
@@ -908,10 +1257,10 @@ export default function App() {
               <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-4">
                 <div>
                   <h2 className="text-lg font-bold text-slate-900">
-                    Customer Queue Check-In
+                    Public Customer Kiosk Check-In
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Enter your name to receive a unique sequential queue number
+                    Open to all visitors · No login required to join the shared queue
                   </p>
                 </div>
                 <span className="text-xs font-mono font-semibold text-slate-700 tabular-nums">
@@ -930,6 +1279,7 @@ export default function App() {
                   <input
                     id="customer-name-input"
                     type="text"
+                    maxLength={MAX_NAME_LENGTH}
                     value={customerName}
                     onChange={(e) => {
                       setCustomerName(e.target.value);
@@ -968,10 +1318,15 @@ export default function App() {
 
                 <button
                   type="submit"
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer"
+                  disabled={isJoiningQueue}
+                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer disabled:opacity-60"
                 >
                   <UserPlus className="w-4 h-4" />
-                  <span>Join Queue &amp; Issue Number</span>
+                  <span>
+                    {isJoiningQueue
+                      ? 'Assigning Ticket...'
+                      : 'Join Shared Queue & Issue Number'}
+                  </span>
                 </button>
               </form>
             </div>
@@ -981,12 +1336,12 @@ export default function App() {
               {lastIssuedTicket ? (
                 <div
                   className="space-y-2"
-                   role="status"
+                  role="status"
                   aria-live="polite"
                   data-testid="issued-ticket-receipt"
                 >
                   <div className="flex items-center justify-between text-xs text-emerald-700 font-semibold">
-                    <span>Ticket Issued Successfully</span>
+                    <span>Shared Facility Ticket Issued</span>
                     <span className="font-mono tabular-nums">
                       {lastIssuedTicket.joinedAt}
                     </span>
@@ -1017,10 +1372,10 @@ export default function App() {
               ) : (
                 <div className="text-xs text-slate-500 space-y-1">
                   <p className="font-medium text-slate-700">
-                    Automatic Sequential Numbering
+                    Atomic Cloud Sequence Counter
                   </p>
                   <p>
-                    Each customer who joins receives a unique queue code in strict arrival order and is placed directly into the active waiting list.
+                    Every check-in atomically increments the shared facility counter in Firestore so multiple kiosks never issue duplicate ticket numbers.
                   </p>
                 </div>
               )}
@@ -1039,7 +1394,7 @@ export default function App() {
                     Customers Currently Waiting
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Live sequential waiting order · Next customer is called from the top of this list
+                    Shared live sequential waiting order · Synchronized across all displays and staff stations
                   </p>
                 </div>
                 <div className="text-xs font-medium text-slate-600 tabular-nums">
@@ -1080,7 +1435,9 @@ export default function App() {
                               )}
                             </div>
                             <div className="flex items-center gap-2 text-xs text-slate-500">
-                              <span className="truncate">{customer.purpose}</span>
+                              <span className="truncate">
+                                {customer.purpose}
+                              </span>
                               <span aria-hidden="true">·</span>
                               <span className="font-mono tabular-nums">
                                 Joined {customer.joinedAt}
@@ -1101,7 +1458,7 @@ export default function App() {
                               )
                             }
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 rounded-md hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                            title={`Call ${customer.queueCode} now`}
+                            title={`Call ${customer.queueCode} now (Staff only)`}
                           >
                             <span>Call</span>
                             <ArrowRight className="w-3 h-3" />
@@ -1118,7 +1475,9 @@ export default function App() {
                     No customers are currently waiting
                   </p>
                   <p className="text-xs text-slate-500 max-w-md mx-auto">
-                    All issued queue numbers have been served or skipped. Use the Customer Queue Check-In form to add the next arriving customer.
+                    All issued queue numbers have been served or skipped. Use
+                    the Public Customer Kiosk Check-In form to add the next
+                    arriving customer.
                   </p>
                   <div className="pt-1">
                     <button
@@ -1141,10 +1500,11 @@ export default function App() {
 
             <div className="mt-4 pt-4 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
               <span>
-                Only customers with <strong>Waiting</strong> status appear here and are eligible for next call.
+                Only customers with <strong>Waiting</strong> status appear here
+                and are eligible for next call.
               </span>
               <span className="font-mono tabular-nums">
-                Total Records: {counts.total}
+                Total Shared Records: {counts.total}
               </span>
             </div>
           </div>
@@ -1162,47 +1522,70 @@ export default function App() {
                   Authorized Staff Queue Management Console
                 </h2>
                 <span className="text-xs text-slate-500">
-                  · Status Control &amp; Sequential Enforcement
+                  ·{' '}
+                  {currentUser && isStaffVerified
+                    ? `Verified Staff (${currentUser.email})`
+                    : 'Staff Sign-In Required for Mutations'}
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-1">
-                Manage all queue tickets across Waiting, Serving, Served, and Skipped states. Already Served or Skipped customers are prevented from being called as the next active customer.
+                Manage all shared queue tickets across Waiting, Serving, Served,
+                and Skipped states. Already Served or Skipped customers are
+                prevented from being called as the next active customer.
               </p>
             </div>
 
             {/* Staff Primary Actions */}
             <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={handleCallNextCustomer}
-                disabled={waitingCustomers.length === 0}
-                className={`inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
-                  waitingCustomers.length > 0
-                    ? 'bg-slate-900 text-white hover:bg-slate-800 cursor-pointer'
-                    : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                }`}
-              >
-                <PhoneCall className="w-3.5 h-3.5" />
-                <span>Call Next Waiting Customer</span>
-              </button>
+              {!currentUser || !isStaffVerified ? (
+                <button
+                  type="button"
+                  onClick={handleGoogleStaffSignIn}
+                  disabled={isSigningIn}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>
+                    {isSigningIn
+                      ? 'Signing In...'
+                      : 'Sign in with Google to Manage Queue'}
+                  </span>
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleCallNextCustomer}
+                    disabled={waitingCustomers.length === 0}
+                    className={`inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                      waitingCustomers.length > 0
+                        ? 'bg-slate-900 text-white hover:bg-slate-800 cursor-pointer'
+                        : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                    }`}
+                  >
+                    <PhoneCall className="w-3.5 h-3.5" />
+                    <span>Call Next Waiting Customer</span>
+                  </button>
 
-              <button
-                type="button"
-                onClick={handleResetDemoData}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Reset Sample Queue</span>
-              </button>
+                  <button
+                    type="button"
+                    onClick={handleResetDemoData}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Reset Sample Queue</span>
+                  </button>
 
-              <button
-                type="button"
-                onClick={handleClearAllQueue}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-rose-700 bg-rose-50 rounded-lg hover:bg-rose-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Clear Queue</span>
-              </button>
+                  <button
+                    type="button"
+                    onClick={handleClearAllQueue}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-rose-700 bg-rose-50 rounded-lg hover:bg-rose-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Clear Queue</span>
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -1300,7 +1683,9 @@ export default function App() {
                 <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
                   <th className="py-3 px-4 whitespace-nowrap">Queue #</th>
                   <th className="py-3 px-4 whitespace-nowrap">Customer Name</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Service Category</th>
+                  <th className="py-3 px-4 whitespace-nowrap">
+                    Service Category
+                  </th>
                   <th className="py-3 px-4 whitespace-nowrap">Timestamps</th>
                   <th className="py-3 px-4 whitespace-nowrap">Current Status</th>
                   <th className="py-3 px-4 text-right whitespace-nowrap">
@@ -1463,7 +1848,8 @@ export default function App() {
                         </button>
                       ) : (
                         <span>
-                          Use the Customer Check-In form above to issue the first queue ticket.
+                          Use the Public Customer Kiosk Check-In form above to
+                          issue the first queue ticket.
                         </span>
                       )}
                     </td>
@@ -1473,11 +1859,11 @@ export default function App() {
             </table>
           </div>
 
-          {/* Recent Activity Log & Sequential Safeguard Note */}
+          {/* Recent Activity Log & Access Model Summary */}
           <div className="pt-2 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-7 space-y-2">
               <h3 className="text-xs font-semibold text-slate-800">
-                Recent Counter Activity
+                Recent Shared Counter Activity
               </h3>
               {activityLog.length > 0 ? (
                 <div className="divide-y divide-slate-200 border-t border-b border-slate-200">
@@ -1514,14 +1900,20 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-5 text-xs text-slate-600 space-y-1.5 bg-slate-50 p-4 rounded-lg border border-slate-200">
-              <div className="font-semibold text-slate-900">
-                Sequential Queue Safeguards
+              <div className="flex items-center gap-1.5 font-semibold text-slate-900">
+                <Users className="w-3.5 h-3.5 text-slate-700" />
+                <span>Shared Facility Access &amp; Security Model</span>
               </div>
               <p>
-                1. <strong>Call Next Customer</strong> strictly selects the earliest customer in <strong>Waiting</strong> status and automatically completes any currently <strong>Serving</strong> ticket.
+                1. <strong>Public Kiosk &amp; Live Display</strong>: Customers
+                can view the shared queue and join in real time without signing
+                in. Firestore rules enforce that kiosk check-ins only create{' '}
+                <strong>Waiting</strong> tickets with atomic sequence numbers.
               </p>
               <p>
-                2. Tickets marked <strong>Served</strong> or <strong>Skipped</strong> are locked from being called as the next active customer unless staff explicitly re-queue them to <strong>Waiting</strong>.
+                2. <strong>Authorized Staff Console</strong>: Calling customers
+                and changing statuses require Google Sign-In verified against the{' '}
+                <code className="font-mono text-[11px]">/admins</code> collection.
               </p>
             </div>
           </div>
@@ -1531,7 +1923,7 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-200 bg-white px-6 lg:px-10 py-4 mt-8">
         <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>QueueLine — Single-Counter Digital Queue Management System</span>
+          <span>QueueLine — Shared-Facility Digital Queue Management System</span>
           <div className="flex items-center gap-4">
             <a href="#live-display" className="hover:text-slate-900">
               Live Display

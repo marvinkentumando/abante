@@ -1,0 +1,234 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'tumando.marvinken@dnsc.edu.ph';
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        isBootstrappedAdmin() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Validation Blueprint: QueueCounter
+    function isValidQueueCounter(data) {
+      return data.keys().hasAll(['id', 'facilityId', 'lastSequenceNumber', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'facilityId', 'lastSequenceNumber', 'updatedAt']) &&
+        data.id is string && data.id == 'main-counter' &&
+        data.facilityId is string && data.facilityId == 'main-counter' &&
+        data.lastSequenceNumber is int && data.lastSequenceNumber >= 100 && data.lastSequenceNumber <= 999999 &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: QueueCustomer
+    function isValidQueueCustomer(data) {
+      return data.keys().hasAll([
+          'id',
+          'facilityId',
+          'sequenceNumber',
+          'queueCode',
+          'name',
+          'purpose',
+          'status',
+          'joinedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'facilityId',
+          'sequenceNumber',
+          'queueCode',
+          'name',
+          'purpose',
+          'status',
+          'joinedAt',
+          'calledAt',
+          'completedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.facilityId is string && data.facilityId == 'main-counter' &&
+        data.sequenceNumber is int && data.sequenceNumber >= 1 && data.sequenceNumber <= 999999 &&
+        data.queueCode is string && data.queueCode.size() >= 3 && data.queueCode.size() <= 16 && data.queueCode.matches('^Q-[0-9]{3,6}$') &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 80 &&
+        data.purpose is string && data.purpose.size() >= 2 && data.purpose.size() <= 80 &&
+        data.status is string && data.status in ['Waiting', 'Serving', 'Served', 'Skipped'] &&
+        data.joinedAt is string && data.joinedAt.size() >= 1 && data.joinedAt.size() <= 32 &&
+        (!('calledAt' in data) || (data.calledAt is string && data.calledAt.size() >= 1 && data.calledAt.size() <= 32)) &&
+        (!('completedAt' in data) || (data.completedAt is string && data.completedAt.size() >= 1 && data.completedAt.size() <= 32)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: QueueActivityEntry
+    function isValidQueueActivity(data) {
+      return data.keys().hasAll([
+          'id',
+          'facilityId',
+          'timestamp',
+          'queueCode',
+          'customerName',
+          'description',
+          'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'facilityId',
+          'timestamp',
+          'queueCode',
+          'customerName',
+          'description',
+          'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.facilityId is string && data.facilityId == 'main-counter' &&
+        data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 32 &&
+        data.queueCode is string && data.queueCode.size() >= 3 && data.queueCode.size() <= 16 && data.queueCode.matches('^Q-[0-9]{3,6}$') &&
+        data.customerName is string && data.customerName.size() >= 2 && data.customerName.size() <= 80 &&
+        data.description is string && data.description.size() >= 2 && data.description.size() <= 200 &&
+        data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: AdminRecord (PII-free)
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'createdAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.createdAt is timestamp;
+    }
+
+    // Collection: /queue_counters/{counterId}
+    match /queue_counters/{counterId} {
+      allow get: if isValidId(counterId) && counterId == 'main-counter';
+      allow list: if false;
+
+      // Initial counter creation (100 for empty start, 101 for first customer, or 107 for initial seed)
+      allow create: if isValidId(counterId) &&
+        counterId == 'main-counter' &&
+        isValidQueueCounter(incoming()) &&
+        incoming().updatedAt == request.time &&
+        (incoming().lastSequenceNumber == 100 || incoming().lastSequenceNumber == 101 || incoming().lastSequenceNumber == 107 || isAdmin());
+
+      // Atomic +1 increment during customer kiosk check-in OR staff reset
+      allow update: if isValidId(counterId) &&
+        counterId == 'main-counter' &&
+        isValidQueueCounter(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().facilityId == existing().facilityId &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['lastSequenceNumber', 'updatedAt']) &&
+        (
+          incoming().lastSequenceNumber == existing().lastSequenceNumber + 1 ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(counterId);
+    }
+
+    // Collection: /queue_customers/{customerId}
+    match /queue_customers/{customerId} {
+      // Shared public queue display & kiosk visibility (strictly scoped to facilityId == 'main-counter')
+      allow get: if isValidId(customerId) && existing().facilityId == 'main-counter';
+      allow list: if existing().facilityId == 'main-counter';
+
+      // Public Kiosk Check-In (strictly Waiting status only) OR Authorized Staff Seed
+      allow create: if isValidId(customerId) &&
+        isValidQueueCustomer(incoming()) &&
+        incoming().id == customerId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (incoming().status == 'Waiting' && !('calledAt' in incoming()) && !('completedAt' in incoming())) ||
+          isAdmin()
+        );
+
+      // Authorized Staff Only: Call next customer or update ticket status
+      allow update: if isAdmin() &&
+        isValidId(customerId) &&
+        isValidQueueCustomer(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().facilityId == existing().facilityId &&
+        incoming().sequenceNumber == existing().sequenceNumber &&
+        incoming().queueCode == existing().queueCode &&
+        incoming().name == existing().name &&
+        incoming().purpose == existing().purpose &&
+        incoming().joinedAt == existing().joinedAt &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Call customer to counter (Strictly only Waiting -> Serving; blocks Served/Skipped -> Serving)
+          (existing().status == 'Waiting' &&
+            incoming().status == 'Serving' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'calledAt', 'updatedAt'])) ||
+          // Action 2: Mark customer as Served or Skipped
+          ((incoming().status == 'Served' || incoming().status == 'Skipped') &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'calledAt', 'completedAt', 'updatedAt'])) ||
+          // Action 3: Mark/re-queue customer as Waiting
+          (incoming().status == 'Waiting' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'completedAt', 'updatedAt']))
+        );
+
+      allow delete: if isAdmin() && isValidId(customerId);
+    }
+
+    // Collection: /queue_activities/{activityId}
+    match /queue_activities/{activityId} {
+      allow get: if isValidId(activityId) && existing().facilityId == 'main-counter';
+      allow list: if existing().facilityId == 'main-counter';
+
+      allow create: if isValidId(activityId) &&
+        isValidQueueActivity(incoming()) &&
+        incoming().id == activityId &&
+        incoming().createdAt == request.time;
+
+      allow update: if false;
+
+      allow delete: if isAdmin() && isValidId(activityId);
+    }
+
+    // Collection: /admins/{adminId}
+    match /admins/{adminId} {
+      allow get: if isVerifiedUser() && isValidId(adminId) && (request.auth.uid == adminId || isAdmin());
+      allow list: if false;
+      allow create: if isVerifiedUser() &&
+        isValidId(adminId) &&
+        (request.auth.uid == adminId || isAdmin()) &&
+        isValidAdminRecord(incoming()) &&
+        incoming().uid == adminId &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(adminId);
+    }
+  }
+}

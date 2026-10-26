@@ -1,0 +1,224 @@
+{
+  "entities": {
+    "QueueCounter": {
+      "title": "QueueCounter",
+      "description": "Atomic sequence counter for the shared facility queue.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Counter document ID (e.g., main-counter).",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "facilityId": {
+          "type": "string",
+          "description": "Shared facility identifier.",
+          "enum": ["main-counter"]
+        },
+        "lastSequenceNumber": {
+          "type": "number",
+          "description": "Last assigned sequential ticket number."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last sequence update."
+        }
+      },
+      "required": ["id", "facilityId", "lastSequenceNumber", "updatedAt"]
+    },
+    "QueueCustomer": {
+      "title": "QueueCustomer",
+      "description": "Represents a customer ticket in the shared single-counter sequential queue.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique document identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "facilityId": {
+          "type": "string",
+          "description": "Shared facility identifier for public display and kiosk queries.",
+          "enum": ["main-counter"]
+        },
+        "sequenceNumber": {
+          "type": "number",
+          "description": "Sequential numeric ticket index (e.g., 101, 102)."
+        },
+        "queueCode": {
+          "type": "string",
+          "description": "Formatted queue ticket code (e.g., Q-101).",
+          "minLength": 3,
+          "maxLength": 16,
+          "pattern": "^Q-[0-9]{3,6}$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Customer full name.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "purpose": {
+          "type": "string",
+          "description": "Service category or visit purpose.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "status": {
+          "type": "string",
+          "description": "Current queue status.",
+          "enum": ["Waiting", "Serving", "Served", "Skipped"]
+        },
+        "joinedAt": {
+          "type": "string",
+          "description": "Formatted check-in time display.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "calledAt": {
+          "type": "string",
+          "description": "Formatted counter call time display.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "completedAt": {
+          "type": "string",
+          "description": "Formatted completion or skip time display.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "facilityId",
+        "sequenceNumber",
+        "queueCode",
+        "name",
+        "purpose",
+        "status",
+        "joinedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "QueueActivityEntry": {
+      "title": "QueueActivityEntry",
+      "description": "Audit log entry for shared facility queue check-ins and staff actions.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique activity log identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "facilityId": {
+          "type": "string",
+          "description": "Shared facility identifier.",
+          "enum": ["main-counter"]
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Formatted time of activity.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "queueCode": {
+          "type": "string",
+          "description": "Queue ticket code referenced by this activity.",
+          "minLength": 3,
+          "maxLength": 16,
+          "pattern": "^Q-[0-9]{3,6}$"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Customer name referenced by this activity.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "description": "Description of the queue action.",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "facilityId",
+        "timestamp",
+        "queueCode",
+        "customerName",
+        "description",
+        "createdAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Authorized staff/admin registry document (PII-free).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "UID of the authorized staff member.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        }
+      },
+      "required": ["uid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/queue_counters/{counterId}": {
+      "schema": {
+        "$ref": "#/entities/QueueCounter"
+      },
+      "description": "Stores atomic sequence counter for the shared facility queue."
+    },
+    "/queue_customers/{customerId}": {
+      "schema": {
+        "$ref": "#/entities/QueueCustomer"
+      },
+      "description": "Stores shared facility customer queue tickets and their sequential status."
+    },
+    "/queue_activities/{activityId}": {
+      "schema": {
+        "$ref": "#/entities/QueueActivityEntry"
+      },
+      "description": "Stores chronological shared queue activity logs."
+    },
+    "/admins/{adminId}": {
+      "schema": {
+        "$ref": "#/entities/AdminRecord"
+      },
+      "description": "Stores verified staff and administrator user IDs."
+    }
+  }
+}
