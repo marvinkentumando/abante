@@ -1,0 +1,6 @@
+{
+  "name": "QueueLine — Digital Queue Management System",
+  "description": "A digital queue management system for offices, clinics, school facilities, and service booths to organize customer ticketing and sequential staff serving.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
