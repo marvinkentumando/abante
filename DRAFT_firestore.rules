@@ -74,6 +74,10 @@ service cloud.firestore {
           'joinedAt',
           'calledAt',
           'completedAt',
+          'isPriority',
+          'priorityCategory',
+          'recallCount',
+          'lastRecalledAt',
           'createdAt',
           'updatedAt'
         ]) &&
@@ -87,6 +91,10 @@ service cloud.firestore {
         data.joinedAt is string && data.joinedAt.size() >= 1 && data.joinedAt.size() <= 32 &&
         (!('calledAt' in data) || (data.calledAt is string && data.calledAt.size() >= 1 && data.calledAt.size() <= 32)) &&
         (!('completedAt' in data) || (data.completedAt is string && data.completedAt.size() >= 1 && data.completedAt.size() <= 32)) &&
+        (!('isPriority' in data) || data.isPriority is bool) &&
+        (!('priorityCategory' in data) || (data.priorityCategory is string && data.priorityCategory in ['Regular', 'Senior Citizen', 'PWD', 'Pregnant', 'Emergency'])) &&
+        (!('recallCount' in data) || (data.recallCount is int && data.recallCount >= 0 && data.recallCount <= 100)) &&
+        (!('lastRecalledAt' in data) || (data.lastRecalledAt is string && data.lastRecalledAt.size() >= 1 && data.lastRecalledAt.size() <= 32)) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -133,14 +141,12 @@ service cloud.firestore {
       allow get: if isValidId(counterId) && counterId == 'main-counter';
       allow list: if false;
 
-      // Initial counter creation (100 for empty start, 101 for first customer, or 107 for initial seed)
       allow create: if isValidId(counterId) &&
         counterId == 'main-counter' &&
         isValidQueueCounter(incoming()) &&
         incoming().updatedAt == request.time &&
         (incoming().lastSequenceNumber == 100 || incoming().lastSequenceNumber == 101 || incoming().lastSequenceNumber == 107 || isAdmin());
 
-      // Atomic +1 increment during customer kiosk check-in OR staff reset
       allow update: if isValidId(counterId) &&
         counterId == 'main-counter' &&
         isValidQueueCounter(incoming()) &&
@@ -158,7 +164,6 @@ service cloud.firestore {
 
     // Collection: /queue_customers/{customerId}
     match /queue_customers/{customerId} {
-      // Shared public queue display & kiosk visibility (strictly scoped to facilityId == 'main-counter')
       allow get: if isValidId(customerId) && existing().facilityId == 'main-counter';
       allow list: if existing().facilityId == 'main-counter';
 
@@ -173,7 +178,7 @@ service cloud.firestore {
           isAdmin()
         );
 
-      // Authorized Staff Only: Call next customer or update ticket status
+      // Authorized Staff Only: Call next customer, recall, toggle priority, or update ticket status
       allow update: if isAdmin() &&
         isValidId(customerId) &&
         isValidQueueCustomer(incoming()) &&
@@ -190,13 +195,20 @@ service cloud.firestore {
           // Action 1: Call customer to counter (Strictly only Waiting -> Serving; blocks Served/Skipped -> Serving)
           (existing().status == 'Waiting' &&
             incoming().status == 'Serving' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'calledAt', 'updatedAt'])) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'calledAt', 'recallCount', 'lastRecalledAt', 'updatedAt'])) ||
           // Action 2: Mark customer as Served or Skipped
           ((incoming().status == 'Served' || incoming().status == 'Skipped') &&
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'calledAt', 'completedAt', 'updatedAt'])) ||
           // Action 3: Mark/re-queue customer as Waiting
           (incoming().status == 'Waiting' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'completedAt', 'updatedAt']))
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'completedAt', 'updatedAt'])) ||
+          // Action 4: Recall active Serving customer
+          (existing().status == 'Serving' &&
+            incoming().status == 'Serving' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['recallCount', 'lastRecalledAt', 'updatedAt'])) ||
+          // Action 5: Update Priority Lane classification
+          (incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['isPriority', 'priorityCategory', 'updatedAt']))
         );
 
       allow delete: if isAdmin() && isValidId(customerId);

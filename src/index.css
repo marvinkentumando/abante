@@ -22,3 +22,24 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+@media print {
+  body {
+    background-color: #FFFFFF !important;
+    color: #000000 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  #printable-ticket-slip {
+    display: block !important;
+    width: 320px;
+    margin: 0 auto;
+    padding: 24px 16px;
+    border: 1px dashed #000000;
+    color: #000000;
+    background: #FFFFFF;
+  }
+}

@@ -92,6 +92,25 @@
           "minLength": 1,
           "maxLength": 32
         },
+        "isPriority": {
+          "type": "boolean",
+          "description": "Whether customer belongs to a priority lane (Senior Citizen, PWD, Pregnant, Emergency)."
+        },
+        "priorityCategory": {
+          "type": "string",
+          "description": "Priority lane category.",
+          "enum": ["Regular", "Senior Citizen", "PWD", "Pregnant", "Emergency"]
+        },
+        "recallCount": {
+          "type": "number",
+          "description": "Number of times active customer has been recalled at the counter."
+        },
+        "lastRecalledAt": {
+          "type": "string",
+          "description": "Formatted time of most recent counter recall.",
+          "minLength": 1,
+          "maxLength": 32
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

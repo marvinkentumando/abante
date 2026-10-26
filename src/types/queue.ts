@@ -5,6 +5,13 @@ export enum QueueStatus {
   Skipped = 'Skipped',
 }
 
+export type PriorityCategory =
+  | 'Regular'
+  | 'Senior Citizen'
+  | 'PWD'
+  | 'Pregnant'
+  | 'Emergency';
+
 export interface QueueCustomer {
   id: string;
   sequenceNumber: number;
@@ -15,6 +22,10 @@ export interface QueueCustomer {
   joinedAt: string;
   calledAt?: string;
   completedAt?: string;
+  isPriority?: boolean;
+  priorityCategory?: PriorityCategory;
+  recallCount?: number;
+  lastRecalledAt?: string;
 }
 
 export interface QueueActivityEntry {
@@ -31,4 +42,6 @@ export interface IssuedTicketReceipt {
   purpose: string;
   joinedAt: string;
   waitingAhead: number;
+  isPriority: boolean;
+  priorityCategory: PriorityCategory;
 }

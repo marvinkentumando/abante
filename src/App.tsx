@@ -15,10 +15,16 @@ import {
   AlertCircle,
   ArrowRight,
   ShieldCheck,
-  Cloud,
   LogIn,
   LogOut,
   Users,
+  Tv,
+  Minimize2,
+  Printer,
+  Download,
+  BellRing,
+  HeartHandshake,
+  Megaphone,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -31,6 +37,7 @@ import {
   doc,
   getDoc,
   setDoc,
+  updateDoc,
   deleteDoc,
   onSnapshot,
   query,
@@ -52,11 +59,13 @@ import {
   QueueCustomer,
   QueueActivityEntry,
   IssuedTicketReceipt,
+  PriorityCategory,
 } from './types/queue';
 import {
   INITIAL_CUSTOMERS,
   INITIAL_ACTIVITY_LOG,
   SERVICE_PURPOSES,
+  PRIORITY_CATEGORIES,
 } from './data/initialQueue';
 
 const SHARED_FACILITY_ID = 'main-counter';
@@ -77,6 +86,50 @@ function formatCurrentTime(): string {
 function sanitizeId(rawId: string): string {
   const cleaned = rawId.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 128);
   return VALID_ID_REGEX.test(cleaned) ? cleaned : `id-${Date.now()}`;
+}
+
+function formatQueueCodeForSpeech(queueCode: string): string {
+  // Convert "Q-104" -> "Q 1 0 4" for clear spoken articulation
+  const parts = queueCode.split('-');
+  if (parts.length === 2) {
+    return `${parts[0]} ${parts[1].split('').join(' ')}`;
+  }
+  return queueCode;
+}
+
+function speakQueueAnnouncement(
+  enabled: boolean,
+  customer: QueueCustomer,
+  isRecall: boolean
+) {
+  if (
+    !enabled ||
+    typeof window === 'undefined' ||
+    !('speechSynthesis' in window)
+  ) {
+    return;
+  }
+  try {
+    window.speechSynthesis.cancel();
+    const spokenCode = formatQueueCodeForSpeech(customer.queueCode);
+    const priorityNote =
+      customer.isPriority &&
+      customer.priorityCategory &&
+      customer.priorityCategory !== 'Regular'
+        ? `, Priority ${customer.priorityCategory} lane,`
+        : '';
+
+    const message = isRecall
+      ? `Recalling ticket ${spokenCode}, ${customer.name}${priorityNote}. Please proceed to the service counter.`
+      : `Now serving ticket ${spokenCode}, ${customer.name}${priorityNote}, at the service counter.`;
+
+    const utterance = new SpeechSynthesisUtterance(message);
+    utterance.rate = 0.96;
+    utterance.pitch = 1.0;
+    window.speechSynthesis.speak(utterance);
+  } catch {
+    // Ignore speech synthesis errors on unsupported browsers
+  }
 }
 
 function playCallChime(enabled: boolean) {
@@ -132,13 +185,25 @@ export default function App() {
   // Customer Check-In Form State (Public Kiosk — No Login Required)
   const [customerName, setCustomerName] = useState('');
   const [customerPurpose, setCustomerPurpose] = useState(SERVICE_PURPOSES[0]);
+  const [customerPriorityCategory, setCustomerPriorityCategory] =
+    useState<PriorityCategory>('Regular');
   const [formError, setFormError] = useState<string | null>(null);
   const [lastIssuedTicket, setLastIssuedTicket] =
     useState<IssuedTicketReceipt | null>(null);
 
+  // Dedicated Full-Screen TV / Monitor Display Mode & Audio/Voice Announcements
+  const [isTvDisplayMode, setIsTvDisplayMode] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
+  const [isFlashingNowServing, setIsFlashingNowServing] =
+    useState<boolean>(false);
+  const [liveClock, setLiveClock] = useState<string>(() => formatCurrentTime());
+
+  // Track previous active serving ticket + recall count to trigger visual flash on updates
+  const prevServingSignatureRef = useRef<string | null>(null);
+
   // Staff Controls & UI Feedback State
   const [showStaffAuthBanner, setShowStaffAuthBanner] = useState<boolean>(false);
-  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [staffBannerMessage, setStaffBannerMessage] = useState<{
     type: 'info' | 'warning' | 'success';
     text: string;
@@ -147,6 +212,14 @@ export default function App() {
   // Staff Console Filtering & Search State
   const [statusFilter, setStatusFilter] = useState<'ALL' | QueueStatus>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
+
+  // Live clock for TV Display Mode
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setLiveClock(formatCurrentTime());
+    }, 15000);
+    return () => clearInterval(timer);
+  }, []);
 
   // 1. Track Firebase Authentication & Verify / Register Staff Admin Record (/admins/{uid})
   useEffect(() => {
@@ -159,10 +232,7 @@ export default function App() {
       }
 
       try {
-        if (
-          user.emailVerified &&
-          user.email === BOOTSTRAPPED_ADMIN_EMAIL
-        ) {
+        if (user.emailVerified && user.email === BOOTSTRAPPED_ADMIN_EMAIL) {
           setIsStaffVerified(true);
           setShowStaffAuthBanner(false);
         } else if (user.emailVerified) {
@@ -189,7 +259,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 2. Attach Real-Time Shared Facility Listeners (Works for BOTH Unauthenticated Kiosk & Authenticated Staff)
+  // 2. Attach Real-Time Shared Facility Listeners
   useEffect(() => {
     const counterRef = doc(db, 'queue_counters', SHARED_FACILITY_ID);
     const customersQuery = query(
@@ -226,7 +296,6 @@ export default function App() {
       async (snapshot) => {
         setIsCloudConnected(true);
 
-        // Seed initial shared queue if empty on first facility startup
         if (
           snapshot.empty &&
           !hasSeededSharedQueueRef.current &&
@@ -235,7 +304,6 @@ export default function App() {
           hasSeededSharedQueueRef.current = true;
           try {
             const batch = writeBatch(db);
-            // If staff is signed in, we can seed all statuses; if public kiosk boots first, seed the Waiting tickets
             const ticketsToSeed = isStaffVerified
               ? INITIAL_CUSTOMERS
               : INITIAL_CUSTOMERS.filter(
@@ -254,6 +322,9 @@ export default function App() {
                 purpose: cust.purpose.slice(0, MAX_PURPOSE_LENGTH),
                 status: cust.status,
                 joinedAt: cust.joinedAt.slice(0, 32),
+                isPriority: Boolean(cust.isPriority),
+                priorityCategory: cust.priorityCategory || 'Regular',
+                recallCount: cust.recallCount || 0,
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
               };
@@ -262,6 +333,9 @@ export default function App() {
               }
               if (isStaffVerified && cust.completedAt) {
                 payload.completedAt = cust.completedAt.slice(0, 32);
+              }
+              if (isStaffVerified && cust.lastRecalledAt) {
+                payload.lastRecalledAt = cust.lastRecalledAt.slice(0, 32);
               }
               batch.set(ref, payload);
             });
@@ -305,6 +379,11 @@ export default function App() {
             joinedAt: data.joinedAt,
             calledAt: data.calledAt,
             completedAt: data.completedAt,
+            isPriority: Boolean(data.isPriority),
+            priorityCategory:
+              (data.priorityCategory as PriorityCategory) || 'Regular',
+            recallCount: Number(data.recallCount) || 0,
+            lastRecalledAt: data.lastRecalledAt,
           };
         });
 
@@ -355,6 +434,84 @@ export default function App() {
     };
   }, [isStaffVerified]);
 
+  // Derived Queue Segments
+  const sortedCustomers = useMemo(() => {
+    return [...customers].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  }, [customers]);
+
+  const currentlyServing = useMemo(() => {
+    return sortedCustomers.find((c) => c.status === QueueStatus.Serving) || null;
+  }, [sortedCustomers]);
+
+  // Priority-aware Waiting Queue:
+  // Places Priority customers (Senior Citizen, PWD, Pregnant, Emergency) ahead of Regular customers
+  // while strictly preserving sequential arrival order (sequenceNumber) within each tier!
+  const waitingCustomers = useMemo(() => {
+    return sortedCustomers
+      .filter((c) => c.status === QueueStatus.Waiting)
+      .sort((a, b) => {
+        const aPrio = a.isPriority ? 1 : 0;
+        const bPrio = b.isPriority ? 1 : 0;
+        if (aPrio !== bPrio) {
+          return bPrio - aPrio; // Priority (1) before Regular (0)
+        }
+        return a.sequenceNumber - b.sequenceNumber;
+      });
+  }, [sortedCustomers]);
+
+  const nextWaitingCustomer = useMemo(() => {
+    return waitingCustomers.length > 0 ? waitingCustomers[0] : null;
+  }, [waitingCustomers]);
+
+  const counts = useMemo(() => {
+    return {
+      total: sortedCustomers.length,
+      waiting: waitingCustomers.length,
+      priorityWaiting: waitingCustomers.filter((c) => c.isPriority).length,
+      serving: sortedCustomers.filter((c) => c.status === QueueStatus.Serving)
+        .length,
+      served: sortedCustomers.filter((c) => c.status === QueueStatus.Served)
+        .length,
+      skipped: sortedCustomers.filter((c) => c.status === QueueStatus.Skipped)
+        .length,
+    };
+  }, [sortedCustomers, waitingCustomers]);
+
+  // Trigger visual flash highlight whenever the active Serving ticket or its recallCount changes
+  useEffect(() => {
+    if (!currentlyServing) {
+      prevServingSignatureRef.current = null;
+      return;
+    }
+    const sig = `${currentlyServing.id}:${currentlyServing.recallCount || 0}`;
+    if (
+      prevServingSignatureRef.current !== null &&
+      prevServingSignatureRef.current !== sig
+    ) {
+      setIsFlashingNowServing(true);
+      const timer = setTimeout(() => setIsFlashingNowServing(false), 2600);
+      prevServingSignatureRef.current = sig;
+      return () => clearTimeout(timer);
+    }
+    prevServingSignatureRef.current = sig;
+  }, [currentlyServing]);
+
+  const filteredStaffCustomers = useMemo(() => {
+    return sortedCustomers.filter((customer) => {
+      const matchesStatus =
+        statusFilter === 'ALL' ? true : customer.status === statusFilter;
+      const q = searchQuery.trim().toLowerCase();
+      const matchesSearch =
+        !q ||
+        customer.name.toLowerCase().includes(q) ||
+        customer.queueCode.toLowerCase().includes(q) ||
+        customer.purpose.toLowerCase().includes(q) ||
+        (customer.priorityCategory &&
+          customer.priorityCategory.toLowerCase().includes(q));
+      return matchesStatus && matchesSearch;
+    });
+  }, [sortedCustomers, statusFilter, searchQuery]);
+
   const handleGoogleStaffSignIn = async () => {
     setIsSigningIn(true);
     try {
@@ -373,7 +530,7 @@ export default function App() {
       setShowStaffAuthBanner(false);
       setStaffBannerMessage({
         type: 'success',
-        text: `Authorized Staff signed in (${result.user.email}). You can now call customers and update ticket statuses on the shared queue.`,
+        text: `Authorized Staff signed in (${result.user.email}). You can now call, recall, and manage tickets on the shared queue.`,
       });
     } catch (error) {
       setStaffBannerMessage({
@@ -400,51 +557,6 @@ export default function App() {
       console.error('Sign out error:', error);
     }
   };
-
-  // Derived Queue Segments (strictly ordered by sequenceNumber)
-  const sortedCustomers = useMemo(() => {
-    return [...customers].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
-  }, [customers]);
-
-  const currentlyServing = useMemo(() => {
-    return sortedCustomers.find((c) => c.status === QueueStatus.Serving) || null;
-  }, [sortedCustomers]);
-
-  const waitingCustomers = useMemo(() => {
-    return sortedCustomers.filter((c) => c.status === QueueStatus.Waiting);
-  }, [sortedCustomers]);
-
-  const nextWaitingCustomer = useMemo(() => {
-    return waitingCustomers.length > 0 ? waitingCustomers[0] : null;
-  }, [waitingCustomers]);
-
-  const counts = useMemo(() => {
-    return {
-      total: sortedCustomers.length,
-      waiting: sortedCustomers.filter((c) => c.status === QueueStatus.Waiting)
-        .length,
-      serving: sortedCustomers.filter((c) => c.status === QueueStatus.Serving)
-        .length,
-      served: sortedCustomers.filter((c) => c.status === QueueStatus.Served)
-        .length,
-      skipped: sortedCustomers.filter((c) => c.status === QueueStatus.Skipped)
-        .length,
-    };
-  }, [sortedCustomers]);
-
-  const filteredStaffCustomers = useMemo(() => {
-    return sortedCustomers.filter((customer) => {
-      const matchesStatus =
-        statusFilter === 'ALL' ? true : customer.status === statusFilter;
-      const q = searchQuery.trim().toLowerCase();
-      const matchesSearch =
-        !q ||
-        customer.name.toLowerCase().includes(q) ||
-        customer.queueCode.toLowerCase().includes(q) ||
-        customer.purpose.toLowerCase().includes(q);
-      return matchesStatus && matchesSearch;
-    });
-  }, [sortedCustomers, statusFilter, searchQuery]);
 
   const logSharedActivity = async (
     queueCode: string,
@@ -477,8 +589,7 @@ export default function App() {
     }
   };
 
-  // Requirement 1 & 2: Public Kiosk Customer Check-In (No Staff Login Required!)
-  // Uses a Firestore Transaction on /queue_counters/main-counter for atomic sequential numbering
+  // Requirement 1 & 2 + Priority Lane Flag: Public Kiosk Customer Check-In
   const handleJoinQueue = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmedName = customerName.trim().slice(0, MAX_NAME_LENGTH);
@@ -495,7 +606,11 @@ export default function App() {
     setFormError(null);
 
     const timeStr = formatCurrentTime();
-    const waitingAheadCount = waitingCustomers.length;
+    const isPrio = customerPriorityCategory !== 'Regular';
+    // Calculate how many people will be ahead of this customer in the priority-ordered queue
+    const waitingAheadCount = isPrio
+      ? waitingCustomers.filter((c) => c.isPriority).length
+      : waitingCustomers.length;
     const safePurpose = customerPurpose.slice(0, MAX_PURPOSE_LENGTH);
 
     try {
@@ -519,7 +634,8 @@ export default function App() {
             updatedAt: serverTimestamp(),
           });
         } else {
-          const currentLast = Number(counterSnap.data().lastSequenceNumber) || 100;
+          const currentLast =
+            Number(counterSnap.data().lastSequenceNumber) || 100;
           assignedSeq = currentLast + 1;
           transaction.update(counterRef, {
             lastSequenceNumber: assignedSeq,
@@ -544,6 +660,9 @@ export default function App() {
           purpose: safePurpose,
           status: QueueStatus.Waiting,
           joinedAt: timeStr.slice(0, 32),
+          isPriority: isPrio,
+          priorityCategory: customerPriorityCategory,
+          recallCount: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -552,18 +671,23 @@ export default function App() {
       });
 
       setCustomerName('');
+      setCustomerPriorityCategory('Regular');
       setLastIssuedTicket({
         queueCode: issuedResult.assignedCode,
         name: trimmedName,
         purpose: safePurpose,
         joinedAt: timeStr,
         waitingAhead: waitingAheadCount,
+        isPriority: isPrio,
+        priorityCategory: customerPriorityCategory,
       });
 
       await logSharedActivity(
         issuedResult.assignedCode,
         trimmedName,
-        `Joined waiting queue via Kiosk (${safePurpose})`
+        isPrio
+          ? `Joined Priority Lane (${customerPriorityCategory} · ${safePurpose})`
+          : `Joined Regular Queue (${safePurpose})`
       );
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, 'queue_customers');
@@ -572,7 +696,44 @@ export default function App() {
     }
   };
 
-  // Requirement 4, 6, 7: Allow Authorized Staff (Google Sign-In + /admins verified) to call the next waiting customer
+  // Printable & Downloadable Ticket Slip Handlers
+  const handlePrintTicketSlip = () => {
+    window.print();
+  };
+
+  const handleDownloadTicketSlip = (ticket: IssuedTicketReceipt) => {
+    const lines = [
+      '========================================',
+      '        QUEUELINE SERVICE TICKET        ',
+      '========================================',
+      `QUEUE NUMBER : ${ticket.queueCode}`,
+      `CUSTOMER     : ${ticket.name}`,
+      `LANE TIER    : ${
+        ticket.isPriority
+          ? `PRIORITY (${ticket.priorityCategory})`
+          : 'Regular Sequential Queue'
+      }`,
+      `SERVICE      : ${ticket.purpose}`,
+      `CHECK-IN TIME: ${ticket.joinedAt}`,
+      `AHEAD IN LINE: ${ticket.waitingAhead} customer(s)`,
+      '----------------------------------------',
+      'Please watch the Live Counter Display',
+      'and listen for your queue number call.',
+      '========================================',
+    ].join('\n');
+
+    const blob = new Blob([lines], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `QueueLine-Ticket-${ticket.queueCode}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Requirement 4, 6, 7: Call Next Waiting Customer (Priority-aware sequential order)
   const handleCallNextCustomer = async () => {
     if (!currentUser || !isStaffVerified) {
       setShowStaffAuthBanner(true);
@@ -615,6 +776,7 @@ export default function App() {
       batch.update(doc(db, 'queue_customers', nextCandidate.id), {
         status: QueueStatus.Serving,
         calledAt: timeStr.slice(0, 32),
+        recallCount: 0,
         updatedAt: serverTimestamp(),
       });
       await batch.commit();
@@ -627,6 +789,9 @@ export default function App() {
     }
 
     playCallChime(soundEnabled);
+    speakQueueAnnouncement(voiceEnabled, nextCandidate, false);
+    setIsFlashingNowServing(true);
+    setTimeout(() => setIsFlashingNowServing(false), 2600);
 
     if (previousServing) {
       await logSharedActivity(
@@ -638,7 +803,9 @@ export default function App() {
     await logSharedActivity(
       nextCandidate.queueCode,
       nextCandidate.name,
-      'Called as next active customer · Status set to Serving'
+      nextCandidate.isPriority
+        ? `Called next from Priority Lane (${nextCandidate.priorityCategory}) · Serving`
+        : 'Called as next active customer · Status set to Serving'
     );
 
     setStaffBannerMessage({
@@ -647,6 +814,92 @@ export default function App() {
         ? `Completed ${previousServing.queueCode} (${previousServing.name}) and called next waiting customer: ${nextCandidate.queueCode} — ${nextCandidate.name}.`
         : `Now serving ${nextCandidate.queueCode} — ${nextCandidate.name}.`,
     });
+  };
+
+  // Recall / Re-Announce Active Customer at Counter
+  const handleRecallActiveCustomer = async () => {
+    if (!currentlyServing) return;
+
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
+      setStaffBannerMessage({
+        type: 'warning',
+        text: 'Sign in with a Staff Google Account to recall the active customer.',
+      });
+      return;
+    }
+
+    const timeStr = formatCurrentTime();
+    const nextRecallCount = (currentlyServing.recallCount || 0) + 1;
+
+    try {
+      await updateDoc(doc(db, 'queue_customers', currentlyServing.id), {
+        recallCount: nextRecallCount,
+        lastRecalledAt: timeStr.slice(0, 32),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.UPDATE,
+        `queue_customers/${currentlyServing.id}`
+      );
+    }
+
+    playCallChime(soundEnabled);
+    speakQueueAnnouncement(voiceEnabled, currentlyServing, true);
+    setIsFlashingNowServing(true);
+    setTimeout(() => setIsFlashingNowServing(false), 2600);
+
+    await logSharedActivity(
+      currentlyServing.queueCode,
+      currentlyServing.name,
+      `Recalled at counter (Recall #${nextRecallCount})`
+    );
+
+    setStaffBannerMessage({
+      type: 'info',
+      text: `Recalled ${currentlyServing.queueCode} (${currentlyServing.name}) — Chime & voice announcement replayed (Recall #${nextRecallCount}).`,
+    });
+  };
+
+  // Toggle Priority Lane status for a customer from Staff Console
+  const handleToggleCustomerPriority = async (customer: QueueCustomer) => {
+    if (!currentUser || !isStaffVerified) {
+      setShowStaffAuthBanner(true);
+      setStaffBannerMessage({
+        type: 'warning',
+        text: 'Sign in with a Staff Google Account to change priority lane assignments.',
+      });
+      return;
+    }
+
+    const nextIsPriority = !customer.isPriority;
+    const nextCategory: PriorityCategory = nextIsPriority
+      ? 'Senior Citizen'
+      : 'Regular';
+
+    try {
+      await updateDoc(doc(db, 'queue_customers', customer.id), {
+        isPriority: nextIsPriority,
+        priorityCategory: nextCategory,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.UPDATE,
+        `queue_customers/${customer.id}`
+      );
+    }
+
+    await logSharedActivity(
+      customer.queueCode,
+      customer.name,
+      nextIsPriority
+        ? `Assigned to Priority Lane (${nextCategory})`
+        : 'Moved to Regular Queue tier'
+    );
   };
 
   // Requirement 5 & 7: Allow Authorized Staff to mark customers as Waiting, Serving, Served, Skipped
@@ -665,7 +918,6 @@ export default function App() {
 
     if (targetCustomer.status === newStatus) return;
 
-    // Requirement 7 enforcement: Prevent already Served or Skipped customers from being called directly as Serving
     if (
       newStatus === QueueStatus.Serving &&
       (targetCustomer.status === QueueStatus.Served ||
@@ -699,6 +951,7 @@ export default function App() {
         batch.update(targetRef, {
           status: QueueStatus.Serving,
           calledAt: timeStr.slice(0, 32),
+          recallCount: 0,
           updatedAt: serverTimestamp(),
         });
       } else if (
@@ -729,6 +982,9 @@ export default function App() {
 
     if (newStatus === QueueStatus.Serving) {
       playCallChime(soundEnabled);
+      speakQueueAnnouncement(voiceEnabled, targetCustomer, false);
+      setIsFlashingNowServing(true);
+      setTimeout(() => setIsFlashingNowServing(false), 2600);
     }
 
     await logSharedActivity(
@@ -770,12 +1026,17 @@ export default function App() {
           purpose: cust.purpose.slice(0, MAX_PURPOSE_LENGTH),
           status: cust.status,
           joinedAt: cust.joinedAt.slice(0, 32),
+          isPriority: Boolean(cust.isPriority),
+          priorityCategory: cust.priorityCategory || 'Regular',
+          recallCount: cust.recallCount || 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
         if (cust.calledAt) payload.calledAt = cust.calledAt.slice(0, 32);
         if (cust.completedAt)
           payload.completedAt = cust.completedAt.slice(0, 32);
+        if (cust.lastRecalledAt)
+          payload.lastRecalledAt = cust.lastRecalledAt.slice(0, 32);
         batch.set(doc(db, 'queue_customers', docId), payload);
       });
 
@@ -872,13 +1133,274 @@ export default function App() {
     }
   };
 
+  // Dedicated Full-Screen TV / Monitor Public Display View
+  if (isTvDisplayMode) {
+    const nextFiveWaiting = waitingCustomers.slice(0, 5);
+    return (
+      <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-6 sm:p-10 no-print">
+        {/* Top Bar for TV Monitor Display */}
+        <header className="flex flex-wrap items-center justify-between gap-6 border-b border-slate-800 pb-5">
+          <div>
+            <div className="text-2xl font-bold tracking-tight text-white">
+              QueueLine Public Monitor
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Main Service Counter · Priority &amp; Sequential Queue Display
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-lg font-mono font-semibold text-slate-200 tabular-nums pr-2">
+              {liveClock}
+            </span>
+
+            <button
+              type="button"
+              onClick={() => setVoiceEnabled((prev) => !prev)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-200 bg-slate-900 border border-slate-700 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Megaphone className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{voiceEnabled ? 'Voice On' : 'Voice Muted'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSoundEnabled((prev) => !prev)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-200 bg-slate-900 border border-slate-700 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {soundEnabled ? (
+                <>
+                  <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Chime On</span>
+                </>
+              ) : (
+                <>
+                  <VolumeX className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Chime Muted</span>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setIsTvDisplayMode(false)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-white rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Minimize2 className="w-3.5 h-3.5" />
+              <span>Exit TV Display</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Main Split: Extra-Large Now Serving (Left 7 Cols) & Next 5 Waiting (Right 5 Cols) */}
+        <div className="my-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1">
+          {/* Now Serving Focal Box */}
+          <div
+            className={`lg:col-span-7 rounded-2xl border p-8 sm:p-12 flex flex-col justify-between transition-opacity duration-200 ${
+              isFlashingNowServing
+                ? 'bg-emerald-950/90 border-emerald-400'
+                : 'bg-slate-900 border-slate-800'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm font-semibold text-emerald-400 tracking-wide">
+                Now Serving at Counter
+              </span>
+              <span className="text-sm font-mono text-slate-400 tabular-nums">
+                {currentlyServing
+                  ? `Called ${currentlyServing.calledAt || currentlyServing.joinedAt}`
+                  : 'Standby'}
+              </span>
+            </div>
+
+            {currentlyServing ? (
+              <div className="my-auto py-8 space-y-4">
+                <div className="text-7xl sm:text-8xl lg:text-9xl font-bold font-mono tracking-tight text-white tabular-nums">
+                  {currentlyServing.queueCode}
+                </div>
+                <div className="text-3xl sm:text-4xl font-bold text-slate-100">
+                  {currentlyServing.name}
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-base text-slate-300 pt-2">
+                  <span>{currentlyServing.purpose}</span>
+                  {currentlyServing.isPriority &&
+                    currentlyServing.priorityCategory && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="inline-flex items-center gap-1.5 font-semibold text-amber-300">
+                          <HeartHandshake className="w-4 h-4" />
+                          <span>
+                            Priority Lane ({currentlyServing.priorityCategory})
+                          </span>
+                        </span>
+                      </>
+                    )}
+                  {Boolean(currentlyServing.recallCount) && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono text-emerald-300 tabular-nums">
+                        Recalled {currentlyServing.recallCount}x
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="my-auto py-12 space-y-3">
+                <div className="text-6xl sm:text-7xl font-bold font-mono text-slate-600 tabular-nums">
+                  — — —
+                </div>
+                <p className="text-2xl font-semibold text-slate-300">
+                  Counter Ready · Waiting for Next Call
+                </p>
+              </div>
+            )}
+
+            <div className="pt-6 border-t border-slate-800 flex flex-wrap items-center justify-between gap-4 text-sm text-slate-400">
+              <span>
+                Please proceed to the counter when your queue number is announced.
+              </span>
+              {currentUser && isStaffVerified && currentlyServing && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleRecallActiveCustomer}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 cursor-pointer"
+                  >
+                    <BellRing className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Recall Customer</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCallNextCustomer}
+                    disabled={waitingCustomers.length === 0}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 disabled:opacity-40 cursor-pointer"
+                  >
+                    <PhoneCall className="w-3.5 h-3.5" />
+                    <span>Call Next</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right 5 Cols: Next 5 Waiting Customers */}
+          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-8 flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between gap-4 border-b border-slate-800 pb-4">
+                <div>
+                  <h2 className="text-xl font-bold text-white">
+                    Up Next in Waiting Line
+                  </h2>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Priority Lane customers are called ahead in arrival order
+                  </p>
+                </div>
+                <span className="text-sm font-mono font-semibold text-amber-400 tabular-nums">
+                  {counts.waiting} Waiting
+                </span>
+              </div>
+
+              {nextFiveWaiting.length > 0 ? (
+                <div className="divide-y divide-slate-800 mt-3">
+                  {nextFiveWaiting.map((cust, index) => (
+                    <div
+                      key={cust.id}
+                      className="py-4 flex items-center justify-between gap-4"
+                    >
+                      <div className="flex items-center gap-4 min-w-0">
+                        <span className="text-sm font-mono font-semibold text-slate-500 tabular-nums w-7 shrink-0">
+                          #{index + 1}
+                        </span>
+                        <span className="text-2xl sm:text-3xl font-bold font-mono text-white tabular-nums shrink-0">
+                          {cust.queueCode}
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-lg font-semibold text-slate-100 truncate">
+                            {cust.name}
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <span className="truncate">{cust.purpose}</span>
+                            {cust.isPriority && cust.priorityCategory && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="text-amber-300 font-semibold whitespace-nowrap">
+                                  Priority ({cust.priorityCategory})
+                                </span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {index === 0 && (
+                        <span className="text-xs font-semibold text-amber-300 whitespace-nowrap shrink-0">
+                          Next Up
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-16 text-center text-slate-500">
+                  No customers currently waiting in line.
+                </div>
+              )}
+            </div>
+
+            <div className="pt-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400 tabular-nums">
+              <span>Priority Waiting: {counts.priorityWaiting}</span>
+              <span>Served Today: {counts.served}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       id="top"
       className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]"
     >
+      {/* Printable Thermal Receipt Slip (Hidden on screen, visible only during @media print) */}
+      {lastIssuedTicket && (
+        <div
+          id="printable-ticket-slip"
+          className="hidden"
+          aria-hidden="true"
+        >
+          <div className="text-center space-y-2 font-mono">
+            <div className="text-xs font-bold tracking-widest">
+              QUEUELINE OFFICIAL TICKET
+            </div>
+            <div className="text-[11px]">Main Service Counter</div>
+            <div className="border-t border-b border-black py-3 my-2">
+              <div className="text-xs">ASSIGNED QUEUE NUMBER</div>
+              <div className="text-4xl font-bold tabular-nums mt-1">
+                {lastIssuedTicket.queueCode}
+              </div>
+              {lastIssuedTicket.isPriority && (
+                <div className="text-xs font-bold mt-1">
+                  PRIORITY LANE: {lastIssuedTicket.priorityCategory}
+                </div>
+              )}
+            </div>
+            <div className="text-left text-xs space-y-1">
+              <div>Customer: {lastIssuedTicket.name}</div>
+              <div>Category: {lastIssuedTicket.purpose}</div>
+              <div>Issued At: {lastIssuedTicket.joinedAt}</div>
+              <div>Ahead in Line: {lastIssuedTicket.waitingAhead}</div>
+            </div>
+            <div className="pt-3 text-[10px] border-t border-black mt-3">
+              Please watch the Live Counter Display and listen for your number.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Strictly 3-Zone Top Navigation Bar */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 lg:px-10 py-3.5 bg-white/95 backdrop-blur border-b border-slate-200">
+      <header className="no-print sticky top-0 z-30 flex items-center justify-between gap-8 px-6 lg:px-10 py-3.5 bg-white/95 backdrop-blur border-b border-slate-200">
         {/* Zone 1: Brand Title (one line, single text element) */}
         <a
           href="#top"
@@ -887,7 +1409,7 @@ export default function App() {
           QueueLine
         </a>
 
-        {/* Zone 2: 4 concise single-line navigation links */}
+        {/* Zone 2: 5 concise single-line navigation links */}
         <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600">
           <a
             href="#live-display"
@@ -913,6 +1435,13 @@ export default function App() {
           >
             Staff Console
           </a>
+          <button
+            type="button"
+            onClick={() => setIsTvDisplayMode(true)}
+            className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            TV Monitor
+          </button>
         </nav>
 
         {/* Zone 3: 1 Primary Action Button */}
@@ -929,10 +1458,10 @@ export default function App() {
       </header>
 
       {/* Main Content Container (1440px desktop baseline) */}
-      <main className="flex-1 w-full max-w-[1360px] mx-auto px-6 lg:px-10 py-8 space-y-8">
+      <main className="no-print flex-1 w-full max-w-[1360px] mx-auto px-6 lg:px-10 py-8 space-y-8">
         {/* Section 1: Live Now Serving Focal Anchor + Key Queue Telemetry */}
         <section id="live-display" className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+          <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
             <div>
               <p className="text-xs font-medium text-slate-500">
                 Shared Facility Cloud Queue ({SHARED_FACILITY_ID}) ·{' '}
@@ -949,8 +1478,32 @@ export default function App() {
               </h1>
             </div>
 
-            {/* Staff Google Auth & Audio Chime Controls */}
-            <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+            {/* TV Display Mode, Voice Announcement, Audio Chime & Staff Auth Controls */}
+            <div className="flex flex-wrap items-center gap-2 self-start lg:self-auto">
+              <button
+                type="button"
+                onClick={() => setIsTvDisplayMode(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-900 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Open distraction-free full-screen TV Monitor mode"
+              >
+                <Tv className="w-3.5 h-3.5 text-slate-700" />
+                <span>TV Display Mode</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setVoiceEnabled((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Toggle Web Speech API voice announcements"
+              >
+                <Megaphone
+                  className={`w-3.5 h-3.5 ${
+                    voiceEnabled ? 'text-emerald-600' : 'text-slate-400'
+                  }`}
+                />
+                <span>{voiceEnabled ? 'Voice On' : 'Voice Muted'}</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => setSoundEnabled((prev) => !prev)}
@@ -1008,7 +1561,9 @@ export default function App() {
                   <span>Authorized Staff Sign-In Required</span>
                 </div>
                 <p className="text-xs text-slate-600">
-                  Customers can view and join the shared queue freely without signing in. Calling the next customer or changing ticket statuses requires an authorized Staff Google account.
+                  Customers can view and join the shared queue freely without
+                  signing in. Calling, recalling, or changing ticket statuses
+                  requires an authorized Staff Google account.
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -1039,8 +1594,12 @@ export default function App() {
           {/* Dominant Visual Focal Anchor: Now Serving Board + Next Up */}
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch">
-              {/* Left 7 Cols: Currently Being Served (Requirement 6) */}
-              <div className="lg:col-span-7 p-6 sm:p-8 flex flex-col justify-between bg-slate-900 text-white">
+              {/* Left 7 Cols: Currently Being Served (Requirement 6 + Recall Button) */}
+              <div
+                className={`lg:col-span-7 p-6 sm:p-8 flex flex-col justify-between text-white transition-colors duration-200 ${
+                  isFlashingNowServing ? 'bg-emerald-950' : 'bg-slate-900'
+                }`}
+              >
                 <div className="flex items-center justify-between gap-4">
                   <span className="text-xs font-medium tracking-wide text-slate-300">
                     Now Serving at Service Counter
@@ -1053,7 +1612,7 @@ export default function App() {
                 </div>
 
                 {currentlyServing ? (
-                  <div className="my-6 flex flex-col sm:flex-row sm:items-baseline justify-between gap-4">
+                  <div className="my-6 flex flex-col xl:flex-row xl:items-baseline justify-between gap-4">
                     <div>
                       <div
                         className="text-5xl sm:text-6xl font-bold font-mono tracking-tight text-white tabular-nums"
@@ -1067,17 +1626,49 @@ export default function App() {
                       >
                         {currentlyServing.name}
                       </div>
-                      <div className="flex items-center gap-2 text-xs text-slate-300 mt-1">
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 mt-1.5">
                         <span>{currentlyServing.purpose}</span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">
                           Joined {currentlyServing.joinedAt}
                         </span>
+                        {currentlyServing.isPriority &&
+                          currentlyServing.priorityCategory && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="inline-flex items-center gap-1 font-semibold text-amber-300">
+                                <HeartHandshake className="w-3.5 h-3.5" />
+                                <span>
+                                  Priority ({currentlyServing.priorityCategory})
+                                </span>
+                              </span>
+                            </>
+                          )}
+                        {Boolean(currentlyServing.recallCount) && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono text-emerald-300 tabular-nums">
+                              Recalled {currentlyServing.recallCount}x
+                              {currentlyServing.lastRecalledAt
+                                ? ` (${currentlyServing.lastRecalledAt})`
+                                : ''}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
 
-                    {/* Direct Staff Actions for the Active Customer */}
-                    <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 sm:pt-0">
+                    {/* Direct Staff Actions for the Active Customer (Including Recall / Ring Again) */}
+                    <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 xl:pt-0">
+                      <button
+                        type="button"
+                        onClick={handleRecallActiveCustomer}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-200 bg-slate-800 border border-amber-500/40 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        title="Replay chime, announce on speaker, and flash display"
+                      >
+                        <BellRing className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Recall / Ring Again</span>
+                      </button>
                       <button
                         type="button"
                         onClick={() =>
@@ -1146,7 +1737,12 @@ export default function App() {
                         <strong className="font-mono text-white tabular-nums">
                           {nextWaitingCustomer.queueCode}
                         </strong>{' '}
-                        ({nextWaitingCustomer.name})
+                        ({nextWaitingCustomer.name}
+                        {nextWaitingCustomer.isPriority &&
+                        nextWaitingCustomer.priorityCategory
+                          ? ` · Priority: ${nextWaitingCustomer.priorityCategory}`
+                          : ''}
+                        )
                       </span>
                     ) : (
                       <span>No additional customers waiting in queue</span>
@@ -1186,8 +1782,8 @@ export default function App() {
                     >
                       {counts.waiting}
                     </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      In shared sequential line
+                    <p className="text-xs text-slate-500 mt-1 tabular-nums">
+                      {counts.priorityWaiting} in Priority Lane
                     </p>
                   </div>
                 </div>
@@ -1248,7 +1844,7 @@ export default function App() {
 
         {/* Section 2: Two-Column Split — Public Customer Kiosk (Left) & Shared Waiting List (Right) */}
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          {/* Left 5 Columns: Public Customer Kiosk Check-In Form (No Sign-In Needed) */}
+          {/* Left 5 Columns: Public Customer Kiosk Check-In Form (With Priority Lane + Printable Slip) */}
           <div
             id="join-queue"
             className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 sm:p-7 flex flex-col justify-between"
@@ -1260,7 +1856,7 @@ export default function App() {
                     Public Customer Kiosk Check-In
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Open to all visitors · No login required to join the shared queue
+                    Open to all visitors · Select Regular or Priority Lane
                   </p>
                 </div>
                 <span className="text-xs font-mono font-semibold text-slate-700 tabular-nums">
@@ -1316,6 +1912,32 @@ export default function App() {
                   </select>
                 </div>
 
+                {/* Priority / Senior / PWD Lane Selector */}
+                <div>
+                  <label
+                    htmlFor="customer-priority-select"
+                    className="block text-xs font-semibold text-slate-800 mb-1.5"
+                  >
+                    Queue Lane / Priority Eligibility
+                  </label>
+                  <select
+                    id="customer-priority-select"
+                    value={customerPriorityCategory}
+                    onChange={(e) =>
+                      setCustomerPriorityCategory(
+                        e.target.value as PriorityCategory
+                      )
+                    }
+                    className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900 transition-colors"
+                  >
+                    {PRIORITY_CATEGORIES.map((cat) => (
+                      <option key={cat.id} value={cat.id}>
+                        {cat.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <button
                   type="submit"
                   disabled={isJoiningQueue}
@@ -1331,11 +1953,11 @@ export default function App() {
               </form>
             </div>
 
-            {/* Issued Ticket Receipt Feedback */}
+            {/* Issued Ticket Receipt Feedback + Print / Download Slip */}
             <div className="mt-6 pt-5 border-t border-slate-200">
               {lastIssuedTicket ? (
                 <div
-                  className="space-y-2"
+                  className="space-y-3"
                   role="status"
                   aria-live="polite"
                   data-testid="issued-ticket-receipt"
@@ -1346,7 +1968,7 @@ export default function App() {
                       {lastIssuedTicket.joinedAt}
                     </span>
                   </div>
-                  <div className="flex items-baseline justify-between gap-4 pt-1">
+                  <div className="flex items-baseline justify-between gap-4">
                     <div>
                       <div className="text-xs text-slate-500">
                         Assigned Queue Number
@@ -1360,29 +1982,54 @@ export default function App() {
                         {lastIssuedTicket.name}
                       </div>
                       <div className="text-xs text-slate-500">
-                        {lastIssuedTicket.purpose} ·{' '}
+                        {lastIssuedTicket.isPriority
+                          ? `Priority (${lastIssuedTicket.priorityCategory})`
+                          : 'Regular Queue'}{' '}
+                        ·{' '}
                         <span className="font-mono tabular-nums">
                           {lastIssuedTicket.waitingAhead}
                         </span>{' '}
-                        ahead in line
+                        ahead
                       </div>
                     </div>
+                  </div>
+
+                  {/* Print Ticket & Save Ticket Actions */}
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={handlePrintTicketSlip}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      <span>Print Ticket Slip</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadTicketSlip(lastIssuedTicket)}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Save Ticket (.txt)</span>
+                    </button>
                   </div>
                 </div>
               ) : (
                 <div className="text-xs text-slate-500 space-y-1">
                   <p className="font-medium text-slate-700">
-                    Atomic Cloud Sequence Counter
+                    Printable Ticket &amp; Priority Lane Support
                   </p>
                   <p>
-                    Every check-in atomically increments the shared facility counter in Firestore so multiple kiosks never issue duplicate ticket numbers.
+                    After joining, customers can print a thermal receipt slip or
+                    save their ticket to their phone. Senior Citizen, PWD,
+                    Pregnant, and Emergency tickets are prioritized automatically.
                   </p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Right 7 Columns: Customers Currently Waiting List (Requirement 3) */}
+          {/* Right 7 Columns: Customers Currently Waiting List (Requirement 3 + Priority Ordering) */}
           <div
             id="waiting-list"
             className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 sm:p-7 flex flex-col justify-between"
@@ -1394,16 +2041,14 @@ export default function App() {
                     Customers Currently Waiting
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Shared live sequential waiting order · Synchronized across all displays and staff stations
+                    Priority Lane tickets are ordered ahead of Regular tickets while preserving arrival sequence
                   </p>
                 </div>
                 <div className="text-xs font-medium text-slate-600 tabular-nums">
                   <span className="font-mono font-bold text-slate-900">
                     {waitingCustomers.length}
                   </span>{' '}
-                  {waitingCustomers.length === 1
-                    ? 'customer waiting'
-                    : 'customers waiting'}
+                  waiting ({counts.priorityWaiting} priority)
                 </div>
               </div>
 
@@ -1424,10 +2069,19 @@ export default function App() {
                             {customer.queueCode}
                           </div>
                           <div className="min-w-0">
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
                               <span className="text-sm font-semibold text-slate-900 truncate">
                                 {customer.name}
                               </span>
+                              {customer.isPriority &&
+                                customer.priorityCategory && (
+                                  <span className="inline-flex items-center gap-1 text-xs font-semibold text-rose-700 whitespace-nowrap">
+                                    <HeartHandshake className="w-3.5 h-3.5 shrink-0" />
+                                    <span>
+                                      Priority ({customer.priorityCategory})
+                                    </span>
+                                  </span>
+                                )}
                               {isNextUp && (
                                 <span className="text-xs font-semibold text-amber-700 whitespace-nowrap">
                                   · Next to be called
@@ -1510,7 +2164,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 3: Authorized Staff Queue Management Console (Req 4, 5, 7) */}
+        {/* Section 3: Authorized Staff Queue Management Console (Req 4, 5, 7 + Priority Toggle) */}
         <section
           id="staff-console"
           className="bg-white border border-slate-200 rounded-xl p-6 sm:p-7 space-y-5"
@@ -1530,8 +2184,8 @@ export default function App() {
               </div>
               <p className="text-xs text-slate-500 mt-1">
                 Manage all shared queue tickets across Waiting, Serving, Served,
-                and Skipped states. Already Served or Skipped customers are
-                prevented from being called as the next active customer.
+                and Skipped states, recall active customers, or toggle Priority
+                Lane eligibility.
               </p>
             </div>
 
@@ -1669,7 +2323,7 @@ export default function App() {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search queue # or customer name..."
+                placeholder="Search queue #, name, or priority..."
                 aria-label="Search queue number or customer name"
                 className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900"
               />
@@ -1684,12 +2338,12 @@ export default function App() {
                   <th className="py-3 px-4 whitespace-nowrap">Queue #</th>
                   <th className="py-3 px-4 whitespace-nowrap">Customer Name</th>
                   <th className="py-3 px-4 whitespace-nowrap">
-                    Service Category
+                    Lane &amp; Category
                   </th>
                   <th className="py-3 px-4 whitespace-nowrap">Timestamps</th>
                   <th className="py-3 px-4 whitespace-nowrap">Current Status</th>
                   <th className="py-3 px-4 text-right whitespace-nowrap">
-                    Staff Status Controls (Mark Customer As)
+                    Staff Status &amp; Priority Controls
                   </th>
                 </tr>
               </thead>
@@ -1716,7 +2370,15 @@ export default function App() {
                           {customer.name}
                         </td>
                         <td className="py-3 px-4 text-xs text-slate-600 whitespace-nowrap">
-                          {customer.purpose}
+                          <span>{customer.purpose}</span>
+                          <span aria-hidden="true"> · </span>
+                          {customer.isPriority ? (
+                            <span className="font-semibold text-rose-700">
+                              Priority ({customer.priorityCategory || 'Senior Citizen'})
+                            </span>
+                          ) : (
+                            <span className="text-slate-500">Regular</span>
+                          )}
                         </td>
                         <td className="py-3 px-4 text-xs text-slate-500 font-mono tabular-nums whitespace-nowrap">
                           <span>In {customer.joinedAt}</span>
@@ -1724,6 +2386,12 @@ export default function App() {
                             <>
                               <span aria-hidden="true"> · </span>
                               <span>Called {customer.calledAt}</span>
+                            </>
+                          )}
+                          {Boolean(customer.recallCount) && (
+                            <>
+                              <span aria-hidden="true"> · </span>
+                              <span>Recalled {customer.recallCount}x</span>
                             </>
                           )}
                           {customer.completedAt && (
@@ -1738,6 +2406,22 @@ export default function App() {
                         </td>
                         <td className="py-3 px-4 text-right whitespace-nowrap">
                           <div className="inline-flex items-center justify-end gap-1">
+                            {/* Priority Lane Toggle Button */}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleToggleCustomerPriority(customer)
+                              }
+                              className={`px-2 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                customer.isPriority
+                                  ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
+                                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                              }`}
+                              title="Toggle Priority Lane status"
+                            >
+                              {customer.isPriority ? 'Priority ★' : 'Set Priority'}
+                            </button>
+
                             {/* Mark as Waiting */}
                             <button
                               type="button"
@@ -1902,18 +2586,18 @@ export default function App() {
             <div className="lg:col-span-5 text-xs text-slate-600 space-y-1.5 bg-slate-50 p-4 rounded-lg border border-slate-200">
               <div className="flex items-center gap-1.5 font-semibold text-slate-900">
                 <Users className="w-3.5 h-3.5 text-slate-700" />
-                <span>Shared Facility Access &amp; Security Model</span>
+                <span>Priority Queue &amp; Counter Announcement Rules</span>
               </div>
               <p>
-                1. <strong>Public Kiosk &amp; Live Display</strong>: Customers
-                can view the shared queue and join in real time without signing
-                in. Firestore rules enforce that kiosk check-ins only create{' '}
-                <strong>Waiting</strong> tickets with atomic sequence numbers.
+                1. <strong>Priority Lane Tiering</strong>: Senior Citizen, PWD,
+                Pregnant, and Emergency tickets are automatically ordered ahead
+                of Regular waiting tickets while preserving arrival sequence
+                within each tier.
               </p>
               <p>
-                2. <strong>Authorized Staff Console</strong>: Calling customers
-                and changing statuses require Google Sign-In verified against the{' '}
-                <code className="font-mono text-[11px]">/admins</code> collection.
+                2. <strong>Recall &amp; TV Display</strong>: Staff can recall
+                active tickets to replay voice announcements and flash the
+                shared TV Display monitor before marking a no-show as Skipped.
               </p>
             </div>
           </div>
@@ -1921,7 +2605,7 @@ export default function App() {
       </main>
 
       {/* Quiet Footer */}
-      <footer className="border-t border-slate-200 bg-white px-6 lg:px-10 py-4 mt-8">
+      <footer className="no-print border-t border-slate-200 bg-white px-6 lg:px-10 py-4 mt-8">
         <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
           <span>QueueLine — Shared-Facility Digital Queue Management System</span>
           <div className="flex items-center gap-4">
@@ -1936,6 +2620,14 @@ export default function App() {
             <a href="#staff-console" className="hover:text-slate-900">
               Staff Console
             </a>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => setIsTvDisplayMode(true)}
+              className="hover:text-slate-900 cursor-pointer"
+            >
+              TV Monitor Mode
+            </button>
           </div>
         </div>
       </footer>

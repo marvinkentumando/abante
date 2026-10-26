@@ -1,4 +1,16 @@
-import { QueueCustomer, QueueStatus, QueueActivityEntry } from '../types/queue';
+import { QueueCustomer, QueueStatus, QueueActivityEntry, PriorityCategory } from '../types/queue';
+
+export const PRIORITY_CATEGORIES: {
+  id: PriorityCategory;
+  label: string;
+  isPriority: boolean;
+}[] = [
+  { id: 'Regular', label: 'Regular Queue', isPriority: false },
+  { id: 'Senior Citizen', label: 'Senior Citizen (Priority)', isPriority: true },
+  { id: 'PWD', label: 'PWD (Priority)', isPriority: true },
+  { id: 'Pregnant', label: 'Pregnant / Expectant (Priority)', isPriority: true },
+  { id: 'Emergency', label: 'Emergency / Urgent (Priority)', isPriority: true },
+];
 
 export const INITIAL_CUSTOMERS: QueueCustomer[] = [
   {
@@ -11,6 +23,9 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     joinedAt: '09:05 AM',
     calledAt: '09:09 AM',
     completedAt: '09:14 AM',
+    isPriority: false,
+    priorityCategory: 'Regular',
+    recallCount: 0,
   },
   {
     id: 'cust-102',
@@ -22,6 +37,10 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     joinedAt: '09:08 AM',
     calledAt: '09:14 AM',
     completedAt: '09:16 AM',
+    isPriority: false,
+    priorityCategory: 'Regular',
+    recallCount: 2,
+    lastRecalledAt: '09:15 AM',
   },
   {
     id: 'cust-103',
@@ -32,6 +51,9 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     status: QueueStatus.Serving,
     joinedAt: '09:12 AM',
     calledAt: '09:17 AM',
+    isPriority: false,
+    priorityCategory: 'Regular',
+    recallCount: 0,
   },
   {
     id: 'cust-104',
@@ -41,15 +63,21 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     purpose: 'Records Request',
     status: QueueStatus.Waiting,
     joinedAt: '09:15 AM',
+    isPriority: false,
+    priorityCategory: 'Regular',
+    recallCount: 0,
   },
   {
     id: 'cust-105',
     sequenceNumber: 105,
     queueCode: 'Q-105',
-    name: 'Sofia Alverez',
+    name: 'Lola Remedios Santos',
     purpose: 'Clinic Check-In',
     status: QueueStatus.Waiting,
     joinedAt: '09:19 AM',
+    isPriority: true,
+    priorityCategory: 'Senior Citizen',
+    recallCount: 0,
   },
   {
     id: 'cust-106',
@@ -59,6 +87,9 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     purpose: 'Account Clearance',
     status: QueueStatus.Waiting,
     joinedAt: '09:22 AM',
+    isPriority: false,
+    priorityCategory: 'Regular',
+    recallCount: 0,
   },
   {
     id: 'cust-107',
@@ -68,6 +99,9 @@ export const INITIAL_CUSTOMERS: QueueCustomer[] = [
     purpose: 'General Inquiry',
     status: QueueStatus.Waiting,
     joinedAt: '09:25 AM',
+    isPriority: true,
+    priorityCategory: 'Pregnant',
+    recallCount: 0,
   },
 ];
 
@@ -77,14 +111,14 @@ export const INITIAL_ACTIVITY_LOG: QueueActivityEntry[] = [
     timestamp: '09:25 AM',
     queueCode: 'Q-107',
     customerName: 'Priya Patel',
-    description: 'Joined waiting queue',
+    description: 'Joined Priority Lane (Pregnant)',
   },
   {
     id: 'act-4',
-    timestamp: '09:22 AM',
-    queueCode: 'Q-106',
-    customerName: 'Thomas Wright',
-    description: 'Joined waiting queue',
+    timestamp: '09:19 AM',
+    queueCode: 'Q-105',
+    customerName: 'Lola Remedios Santos',
+    description: 'Joined Priority Lane (Senior Citizen)',
   },
   {
     id: 'act-3',
@@ -98,7 +132,7 @@ export const INITIAL_ACTIVITY_LOG: QueueActivityEntry[] = [
     timestamp: '09:16 AM',
     queueCode: 'Q-102',
     customerName: 'Marcus Vance',
-    description: 'Marked as Skipped (no response at counter)',
+    description: 'Marked as Skipped after 2 recalls',
   },
   {
     id: 'act-1',
